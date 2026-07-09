@@ -36,6 +36,7 @@ Environment knobs (export before running pip install .):
 
 GPU backends:
   CPUINFER_USE_CUDA=0/1           -DKTRANSFORMERS_USE_CUDA
+  CPUINFER_CUDA_ARCHS=80;86;89;90 CMAKE_CUDA_ARCHITECTURES override
   CPUINFER_USE_ROCM=0/1           -DKTRANSFORMERS_USE_ROCM
   CPUINFER_USE_MUSA=0/1           -DKTRANSFORMERS_USE_MUSA
   CPUINFER_USE_MACA=0/1           -DKTRANSFORMERS_USE_MACA
@@ -461,29 +462,15 @@ class CMakeBuild(build_ext):
             cfg: Build type (Release/Debug/etc.)
         """
 
-        # Auto-detect CUDA toolkit if user did not explicitly set CPUINFER_USE_CUDA
-        def detect_cuda_toolkit() -> bool:
-            # Respect CUDA_HOME
-            cuda_home = os.environ.get("CUDA_HOME")
-            if cuda_home:
-                nvcc_path = Path(cuda_home) / "bin" / "nvcc"
-                if nvcc_path.exists():
-                    return True
-            # PATH lookup
-            if shutil.which("nvcc") is not None:
-                return True
-            # Common default install prefix
-            if Path("/usr/local/cuda/bin/nvcc").exists():
-                return True
-            return False
-
         # Locate nvcc executable (without forcing user to set -DCMAKE_CUDA_COMPILER)
         def find_nvcc_path() -> str | None:
+            # Respect CUDA_HOME
             cuda_home = os.environ.get("CUDA_HOME")
             if cuda_home:
                 cand = Path(cuda_home) / "bin" / "nvcc"
                 if cand.exists():
                     return str(cand)
+            # PATH lookup
             which_nvcc = shutil.which("nvcc")
             if which_nvcc:
                 return which_nvcc
@@ -497,6 +484,35 @@ class CMakeBuild(build_ext):
                 if Path(cand).exists():
                     return cand
             return None
+
+        # Auto-detect CUDA toolkit if user did not explicitly set CPUINFER_USE_CUDA
+        def detect_cuda_toolkit() -> bool:
+            return find_nvcc_path() is not None
+
+        def detect_cuda_version(nvcc_path: str | None) -> tuple[int, int] | None:
+            if not nvcc_path:
+                return None
+            try:
+                result = subprocess.run(
+                    [nvcc_path, "--version"],
+                    check=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            except Exception:
+                return None
+            match = re.search(r"release\s+(\d+)\.(\d+)", result.stdout)
+            if not match:
+                return None
+            return int(match.group(1)), int(match.group(2))
+
+        def default_cuda_archs(nvcc_path: str | None) -> str:
+            archs = ["80", "86", "89", "90"]
+            cuda_version = detect_cuda_version(nvcc_path)
+            if cuda_version is not None and cuda_version >= (12, 8):
+                archs.append("120")
+            return ";".join(archs)
 
         def find_maca_path() -> str | None:
             for cand in [
@@ -662,6 +678,7 @@ class CMakeBuild(build_ext):
         if _env_get_bool("CPUINFER_USE_CUDA", False):
             cmake_args.append("-DKTRANSFORMERS_USE_CUDA=ON")
             print("-- Enabling CUDA backend (-DKTRANSFORMERS_USE_CUDA=ON)")
+            nvcc_path = find_nvcc_path()
             # Inject nvcc compiler path automatically unless user already specified one.
             user_specified_compiler = any("CMAKE_CUDA_COMPILER" in a for a in cmake_args)
             if not user_specified_compiler:
@@ -669,7 +686,6 @@ class CMakeBuild(build_ext):
                 if "CMAKE_CUDA_COMPILER" in extra_env:
                     user_specified_compiler = True
             if not user_specified_compiler:
-                nvcc_path = find_nvcc_path()
                 if nvcc_path:
                     cmake_args.append(f"-DCMAKE_CUDA_COMPILER={nvcc_path}")
                     print(f"-- Auto-detected nvcc: {nvcc_path} (adding -DCMAKE_CUDA_COMPILER)")
@@ -680,9 +696,12 @@ class CMakeBuild(build_ext):
                 hostcxx = os.environ["CUDAHOSTCXX"]
                 cmake_args.append(f"-DCMAKE_CUDA_HOST_COMPILER={hostcxx}")
                 print(f"-- Using CUDA host compiler from CUDAHOSTCXX: {hostcxx}")
-            # Set CUDA architectures (default: Ampere/Ada/Hopper)
-            archs_env = os.environ.get("CPUINFER_CUDA_ARCHS", "80;86;89;90").strip()
-            if archs_env and not any("CMAKE_CUDA_ARCHITECTURES" in a for a in cmake_args):
+            # Set CUDA architectures (default: Ampere/Ada/Hopper, plus SM120 when nvcc supports it)
+            archs_env = os.environ.get("CPUINFER_CUDA_ARCHS", default_cuda_archs(nvcc_path)).strip()
+            user_specified_archs = any("CMAKE_CUDA_ARCHITECTURES" in a for a in cmake_args) or (
+                "CMAKE_CUDA_ARCHITECTURES" in os.environ.get("CMAKE_ARGS", "")
+            )
+            if archs_env and not user_specified_archs:
                 cmake_args.append(f"-DCMAKE_CUDA_ARCHITECTURES={archs_env}")
                 print(f"-- Set CUDA architectures: {archs_env}")
         if _env_get_bool("CPUINFER_USE_ROCM", False):

@@ -59,8 +59,8 @@ pip install kt-kernel
 **Features:**
 - ✅ **Automatic CPU detection**: Detects your CPU and loads the optimal kernel variant
 - ✅ **CPU multi-variant support**: Includes AMX, AVX512 (Base/VNNI/VBMI/BF16), and AVX2 variants
-- ✅ **CUDA support included**: GPU acceleration for NVIDIA GPUs (SM 80, 86, 89, 90)
-- ✅ **No compilation needed**: Pre-built wheels for Python 3.10, 3.11, 3.12
+- ✅ **CUDA support included**: GPU acceleration for NVIDIA GPUs (pre-built wheels support SM 80, 86, 89, 90; SM 120 requires a source build)
+- ✅ **No compilation needed**: Pre-built wheels for Python 3.10, 3.11, 3.12 on supported wheel targets
 - ✅ **Static CUDA runtime**: No CUDA toolkit installation required
 - ✅ **Works on CPU-only systems**: CUDA features automatically disabled when GPU not available
 
@@ -79,7 +79,7 @@ pip install kt-kernel
 ```
 
 **Features:**
-- ✅ **Multi-architecture support**: Single wheel supports SM 80/86/89/90 (Ampere, Ada, Hopper)
+- ✅ **Multi-architecture support**: Single wheel supports SM 80/86/89/90 (Ampere, Ada, Hopper); source builds can target SM 120 (Blackwell workstation/server)
 - ✅ **Static CUDA runtime**: No CUDA toolkit installation required
 - ✅ **Broad compatibility**: Works with CUDA 11.8+ and 12.x drivers
 - ✅ **PyTorch compatible**: Works with any PyTorch CUDA variant (cu118, cu121, cu124)
@@ -89,6 +89,7 @@ pip install kt-kernel
 - Linux x86-64 (manylinux_2_17 compatible)
 - NVIDIA GPU with compute capability 8.0+ (Ampere or newer)
   - ✅ Supported: A100, RTX 3000/4000 series, H100
+  - SM 120 / RTX PRO 6000 Blackwell: build from source with CUDA 12.8+ or CUDA 13 and `CPUINFER_CUDA_ARCHS=120`
   - ❌ Not supported: V100, P100, GTX 1000/2000 series (too old)
 - NVIDIA driver with CUDA 11.8+ or 12.x support (no CUDA toolkit needed)
 
@@ -96,6 +97,7 @@ pip install kt-kernel
 
 | GPU Architecture | Compute Capability | Supported | Example GPUs |
 |-----------------|-------------------|-----------|-------------|
+| Blackwell workstation/server | 12.0 | Source build | RTX PRO 6000 Blackwell |
 | Hopper | 9.0 | ✅ | H100, H200 |
 | Ada Lovelace | 8.9 | ✅ | RTX 4090, 4080, 4070 |
 | Ampere | 8.6 | ✅ | RTX 3090, 3080, 3070, 3060 |
@@ -104,7 +106,8 @@ pip install kt-kernel
 | Volta | 7.0 | ❌ | V100 |
 
 **CUDA Driver Compatibility (for GPU features):**
-- CUDA 11.8, 11.9, 12.0-12.6+: Full support
+- CUDA 11.8, 11.9, 12.0-12.6: Full support for pre-built wheel targets
+- CUDA 12.8+ or CUDA 13: Required for SM 120 source builds
 - CUDA 11.0-11.7: Not supported (upgrade driver or use CPU-only)
 
 **CPU Variants Included:**
@@ -681,6 +684,7 @@ If you prefer manual installation without the `install.sh` script:
 | `CPUINFER_BUILD_TYPE` | `Release`, `Debug`, `RelWithDebInfo` | Build type (default: `Release`) |
 | `CPUINFER_PARALLEL` | Number | Parallel build jobs (default: auto-detect) |
 | `CPUINFER_VERBOSE` | `0`, `1` | Verbose build output (default: `0`) |
+| `CPUINFER_CUDA_ARCHS` | CMake arch list | CUDA architectures to build, for example `120` for RTX PRO 6000 Blackwell |
 
 **Instruction Set Details:**
 

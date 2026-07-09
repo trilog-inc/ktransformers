@@ -24,12 +24,20 @@ OPTIONS:
   --manual            Pass through to kt-kernel (manual CPU config)
   --no-clean          Pass through to kt-kernel (skip build clean)
 
+ENVIRONMENT:
+  SGLANG_SOURCE_DIR   Install SGLang from this checkout instead of
+                      third_party/sglang. Use this for local backports or
+                      source builds that are not yet in the pinned submodule.
+
 EXAMPLES:
   # Full install (recommended)
   $0
 
   # Install everything in editable mode for development
   $0 all --editable
+
+  # Install kt-kernel with a local SGLang checkout
+  SGLANG_SOURCE_DIR=/path/to/sglang $0 all --editable
 
   # Install sglang only
   $0 sglang
@@ -90,8 +98,16 @@ init_submodules() {
   fi
 
   cd "$REPO_ROOT"
-  git submodule update --init --recursive
-  log_info "Submodules initialized successfully."
+  if [ -n "${SGLANG_SOURCE_DIR:-}" ]; then
+    git submodule update --init --recursive \
+      third_party/custom_flashinfer \
+      third_party/llama.cpp \
+      third_party/pybind11
+    log_info "Submodules initialized successfully (skipped third_party/sglang because SGLANG_SOURCE_DIR is set)."
+  else
+    git submodule update --init --recursive
+    log_info "Submodules initialized successfully."
+  fi
 }
 
 # ─── sglang install ───────────────────────────────────────────────────────────
@@ -102,11 +118,19 @@ install_sglang() {
   log_step "Installing sglang (kvcache-ai fork)"
 
   local sglang_dir="$REPO_ROOT/third_party/sglang"
+  if [ -n "${SGLANG_SOURCE_DIR:-}" ]; then
+    if [ ! -d "$SGLANG_SOURCE_DIR" ]; then
+      log_error "SGLANG_SOURCE_DIR does not exist: $SGLANG_SOURCE_DIR"
+      exit 1
+    fi
+    sglang_dir="$(cd "$SGLANG_SOURCE_DIR" && pwd)"
+    log_info "Using SGLANG_SOURCE_DIR: $sglang_dir"
+  fi
   local pyproject="$sglang_dir/python/pyproject.toml"
 
   if [ ! -f "$pyproject" ]; then
     log_error "sglang source not found at $sglang_dir"
-    log_error "Run 'git submodule update --init --recursive' first, or clone with --recursive."
+    log_error "Run 'git submodule update --init --recursive' first, clone with --recursive, or set SGLANG_SOURCE_DIR."
     exit 1
   fi
 

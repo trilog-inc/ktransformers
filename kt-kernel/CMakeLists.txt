@@ -432,10 +432,15 @@ if(KTRANSFORMERS_USE_CUDA)
     enable_language(CUDA)
     add_compile_definitions(KTRANSFORMERS_USE_CUDA=1)
 
-    # Set default CUDA architectures if not specified
-    # Target: SM 80/86 (Ampere), 89 (Ada), 90 (Hopper)
+    # Set default CUDA architectures if not specified.
+    # Target: SM 80/86 (Ampere), 89 (Ada), 90 (Hopper), and SM 120
+    # (Blackwell workstation/server) when the CUDA toolkit supports it.
     if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
-        set(CMAKE_CUDA_ARCHITECTURES "80;86;89;90" CACHE STRING "CUDA architectures" FORCE)
+        set(KTRANSFORMERS_DEFAULT_CUDA_ARCHITECTURES "80;86;89;90")
+        if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "12.8")
+            list(APPEND KTRANSFORMERS_DEFAULT_CUDA_ARCHITECTURES "120")
+        endif()
+        set(CMAKE_CUDA_ARCHITECTURES "${KTRANSFORMERS_DEFAULT_CUDA_ARCHITECTURES}" CACHE STRING "CUDA architectures" FORCE)
         message(STATUS "CUDA architectures (default): ${CMAKE_CUDA_ARCHITECTURES}")
     else()
         message(STATUS "CUDA architectures (user): ${CMAKE_CUDA_ARCHITECTURES}")

@@ -38,7 +38,22 @@ Before starting, ensure you have:
    pip install sglang-kt
    ```
 
+   For RTX PRO 6000 / SM120 FP8 deployments, use an SGLang checkout that includes the SM120 DeepGEMM and FlashInfer sparse MLA backports instead of the pinned submodule:
+
+   ```bash
+   git clone https://github.com/kvcache-ai/ktransformers.git
+   cd ktransformers
+
+   export CPUINFER_CUDA_ARCHS=120
+   export TORCH_CUDA_ARCH_LIST="12.0+PTX"
+   export FLASHINFER_CUDA_ARCH_LIST=12.0f
+
+   SGLANG_SOURCE_DIR=/path/to/sglang-sm120 ./install.sh all --editable
+   ```
+
 2. **KT-Kernel installed**
+
+   If you used the SM120 one-click command above, KT-Kernel is already installed. Otherwise:
 
    ```bash
    git clone https://github.com/kvcache-ai/ktransformers.git
@@ -62,7 +77,7 @@ Before starting, ensure you have:
 
    > **Note:** `transformers==5.3.0` may be incompatible with some older models. Use a separate virtual environment for GLM-5/5.1/5.2 if you also serve those models.
 
-4. **CUDA toolkit** - CUDA 12.0+ recommended; CUDA 12.8+ is recommended for FP8 deployments.
+4. **CUDA toolkit** - CUDA 12.0+ recommended; CUDA 12.8+ or CUDA 13 is recommended for FP8 deployments. SM120 requires source builds of DeepGEMM and FlashInfer that target Blackwell workstation/server GPUs.
 5. **Hugging Face CLI** - For downloading models:
 
    ```bash
@@ -91,10 +106,12 @@ Start the SGLang server with KT-Kernel integration for CPU-GPU heterogeneous inf
 
 The FP8 command below follows the validated GLM-5.2 KT launch shape. It uses FP8 model weights, FP8 KV cache, NSA attention, TP8, dynamic expert updates, and uniform expert placement.
 
+For SM120 GPUs, keep JIT DeepGEMM enabled and use the FlashInfer sparse MLA NSA backend. The explicit NSA backend flags below are intentional: they make the launch fail early if the required FlashInfer source build is missing.
+
 ```bash
 # FP8 Precision
 export PYTORCH_ALLOC_CONF=expandable_segments:True
-export SGLANG_ENABLE_JIT_DEEPGEMM=0
+export SGLANG_ENABLE_JIT_DEEPGEMM=1
 
 python -m sglang.launch_server \
   --model-path /path/to/GLM-5.2-FP8 \
@@ -115,7 +132,9 @@ python -m sglang.launch_server \
   --max-total-tokens 4096 \
   --max-running-requests 8 \
   --attention-backend nsa \
-  --fp8-gemm-backend cutlass \
+  --nsa-prefill-backend flashinfer_sparse_mla \
+  --nsa-decode-backend flashinfer_sparse_mla \
+  --fp8-gemm-backend deep_gemm \
   --disable-shared-experts-fusion \
   --tool-call-parser glm47 \
   --reasoning-parser glm45 \
@@ -240,6 +259,10 @@ The launch command in this tutorial uses a smaller `--max-total-tokens` value fo
 **Model implementation errors**
 
 Make sure your SGLang build includes GLM-5.2 model support and that `--trust-remote-code` is enabled.
+
+**SM120 FP8 startup errors**
+
+If DeepGEMM reports that SM120 is unsupported, rebuild SGLang with a DeepGEMM revision that contains SM120 kernels and keep `SGLANG_ENABLE_JIT_DEEPGEMM=1`. If `flashinfer_sparse_mla` is unavailable, rebuild FlashInfer from a revision that contains sparse MLA support and use `FLASHINFER_CUDA_ARCH_LIST=12.0f`.
 
 **OOM during startup or serving**
 
