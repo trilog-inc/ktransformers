@@ -39,6 +39,7 @@ GPU backends:
   CPUINFER_USE_ROCM=0/1           -DKTRANSFORMERS_USE_ROCM
   CPUINFER_USE_MUSA=0/1           -DKTRANSFORMERS_USE_MUSA
   CPUINFER_USE_MACA=0/1           -DKTRANSFORMERS_USE_MACA
+  CPUINFER_CUDA_ARCHS=120          CUDA architectures; SM120 is auto-added with CUDA >=12.8
   MACA_PATH=/opt/maca             MACA SDK root
 
 Usage:
@@ -489,6 +490,8 @@ class CMakeBuild(build_ext):
                 return which_nvcc
             # Common fallbacks (ordered by preference)
             for cand in [
+                "/usr/local/cuda-13.3/bin/nvcc",
+                "/usr/local/cuda-13/bin/nvcc",
                 "/usr/local/cuda-12.6/bin/nvcc",
                 "/usr/local/cuda/bin/nvcc",
                 "/usr/bin/nvcc",
@@ -680,8 +683,24 @@ class CMakeBuild(build_ext):
                 hostcxx = os.environ["CUDAHOSTCXX"]
                 cmake_args.append(f"-DCMAKE_CUDA_HOST_COMPILER={hostcxx}")
                 print(f"-- Using CUDA host compiler from CUDAHOSTCXX: {hostcxx}")
-            # Set CUDA architectures (default: Ampere/Ada/Hopper)
-            archs_env = os.environ.get("CPUINFER_CUDA_ARCHS", "80;86;89;90").strip()
+            # CUDA 12.8+ can compile Blackwell client SM120. Keep older
+            # defaults portable, but include SM120 automatically when the
+            # selected toolkit understands it (including CUDA 13.3).
+            archs_env = os.environ.get("CPUINFER_CUDA_ARCHS")
+            if archs_env is None:
+                archs_env = "80;86;89;90"
+                detected_nvcc = find_nvcc_path()
+                if detected_nvcc:
+                    try:
+                        nvcc_output = subprocess.check_output(
+                            [detected_nvcc, "--version"], text=True
+                        )
+                        match = re.search(r"release\s+(\d+)\.(\d+)", nvcc_output)
+                        if match and tuple(map(int, match.groups())) >= (12, 8):
+                            archs_env += ";120"
+                    except (OSError, subprocess.SubprocessError):
+                        pass
+            archs_env = archs_env.strip()
             if archs_env and not any("CMAKE_CUDA_ARCHITECTURES" in a for a in cmake_args):
                 cmake_args.append(f"-DCMAKE_CUDA_ARCHITECTURES={archs_env}")
                 print(f"-- Set CUDA architectures: {archs_env}")

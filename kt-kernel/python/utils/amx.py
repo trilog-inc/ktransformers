@@ -54,6 +54,7 @@ _HAS_AVX2_MXFP4_SUPPORT = AVX2MXFP4_MOE is not None
 _HAS_AVX2_MXFP8_SUPPORT = AVX2MXFP8_MOE is not None
 _HAS_AVXVNNI256_GPTQ_INT4_SUPPORT = AVXVNNI256GPTQInt4_MOE is not None
 _HAS_AVXVNNI256_RAW_INT4_SUPPORT = AVXVNNI256RawInt4_MOE is not None
+_COMPILED_WITH_AMX_BF16 = bool(getattr(_moe_mod, "HAS_AMX_BF16", False))
 _AVXVNNI256_GPTQ_INT4_MAX_GROUP_SIZE = 256
 _AVXVNNI256_RAW_INT4_MAX_GROUP_SIZE = 256
 
@@ -71,6 +72,7 @@ def _host_has_cpu_flag(*flag_names: str) -> bool:
 
 
 _HOST_HAS_AVX_VNNI = _host_has_cpu_flag("avx_vnni", "avxvnni")
+_HOST_HAS_AMX_BF16 = _host_has_cpu_flag("amx_tile") and _host_has_cpu_flag("amx_bf16")
 
 
 def _supports_avxvnni256_gptq_int4_group_size(group_size: Optional[int]) -> bool:
@@ -151,9 +153,13 @@ def _select_rawint4_backend(group_size: Optional[int] = None):
 
 
 def _select_mxfp4_backend():
-    """Select MXFP4 backend: AMX/AVX-512 (preferred) > AVX2 (fallback).
+    """Select a native MXFP4 backend without converting weights to INT4.
 
-    Override with KT_MXFP4_BACKEND=avx2|amx.
+    The high-throughput backend expands packed E2M1 tiles on demand and uses
+    AMX-BF16 when both the extension and host support it. Small per-expert
+    batches adaptively remain on AVX512-BF16. Override with
+    KT_MXFP4_BACKEND=avx2|amx; tune the crossover with
+    KT_MXFP4_AMX_MIN_TOKENS_PER_EXPERT (default: 4).
     Returns None if no MXFP4 backend is available.
     """
     forced = os.getenv("KT_MXFP4_BACKEND", "").strip().lower()
@@ -162,7 +168,17 @@ def _select_mxfp4_backend():
         if not _HAS_MXFP4_SUPPORT:
             raise RuntimeError(
                 "KT_MXFP4_BACKEND=amx requested, but AMXFP4_KGroup_MOE is not compiled in. "
-                "Recompile with AVX512F + AVX512BW + AVX512_BF16 enabled."
+                "Recompile with KTRANSFORMERS_CPU_USE_AMX_AVX512=ON and "
+                "KTRANSFORMERS_CPU_USE_AMX=ON."
+            )
+        if not _COMPILED_WITH_AMX_BF16:
+            raise RuntimeError(
+                "KT_MXFP4_BACKEND=amx requested, but this extension was built without AMX-BF16. "
+                "Recompile with KTRANSFORMERS_CPU_USE_AMX=ON."
+            )
+        if not _HOST_HAS_AMX_BF16:
+            raise RuntimeError(
+                "KT_MXFP4_BACKEND=amx requested, but the host lacks amx_tile and amx_bf16."
             )
         return AMXFP4_KGroup_MOE
 
@@ -174,7 +190,10 @@ def _select_mxfp4_backend():
             )
         return AVX2MXFP4_MOE
 
-    if _HAS_MXFP4_SUPPORT:
+    # An AMX-targeted extension enters its tile configuration from the class
+    # constructor/tasks, so never load it on an incompatible CPU. An AVX512-
+    # only build of the same class remains a valid native-MXFP4 fallback.
+    if _HAS_MXFP4_SUPPORT and (not _COMPILED_WITH_AMX_BF16 or _HOST_HAS_AMX_BF16):
         return AMXFP4_KGroup_MOE
     if _HAS_AVX2_MXFP4_SUPPORT:
         return AVX2MXFP4_MOE
@@ -707,7 +726,16 @@ class NativeMoEWrapper(BaseMoEWrapper):
         weights = None
         for base_key in _candidates:
             try:
-                weights = self.loader.load_experts(base_key)
+                if self.method == "MXFP4":
+                    # A compact KT expert space maps directly to the selected
+                    # checkpoint logical IDs. Do not mmap/convert scales for
+                    # the complementary GPU-resident experts.
+                    weights = self.loader.load_experts(
+                        base_key,
+                        expert_ids=physical_to_logical_map_cpu.tolist(),
+                    )
+                else:
+                    weights = self.loader.load_experts(base_key)
                 break
             except (ValueError, KeyError):
                 continue
@@ -754,7 +782,10 @@ class NativeMoEWrapper(BaseMoEWrapper):
             elif self.method == "MXFP4":
                 # ue8m0 is losslessly representable in bf16 (8-bit exponent, 0 mantissa);
                 # the loader has already done that conversion.
-                assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 scales for MXFP4"
+                first_gate_scale = next(
+                    scale for scale in self.gate_scales if scale is not None
+                )
+                assert first_gate_scale.dtype == torch.bfloat16, "Expected bf16 scales for MXFP4"
             elif self.method == "MXFP8":
                 # ue8m0 scales stay as uint8; C++ convert_ue8m0_to_fp32 handles conversion.
                 assert self.gate_scales[0].dtype == torch.uint8, "Expected uint8 (ue8m0) scales for MXFP8"
@@ -763,9 +794,9 @@ class NativeMoEWrapper(BaseMoEWrapper):
 
         # Build pointer lists: [numa_id][expert_id] -> pointer
         # Since RAWINT4/FP8/BF16 has no numa sharding, numa dimension is 1
-        gate_ptrs = [[t.data_ptr() for t in self.gate_weights]]
-        up_ptrs = [[t.data_ptr() for t in self.up_weights]]
-        down_ptrs = [[t.data_ptr() for t in self.down_weights]]
+        gate_ptrs = [[0 if t is None else t.data_ptr() for t in self.gate_weights]]
+        up_ptrs = [[0 if t is None else t.data_ptr() for t in self.up_weights]]
+        down_ptrs = [[0 if t is None else t.data_ptr() for t in self.down_weights]]
 
         # BF16 has no scales, pass empty lists (will use 0/nullptr for consistency)
         if self.method == "BF16":
@@ -773,9 +804,15 @@ class NativeMoEWrapper(BaseMoEWrapper):
             up_scale_ptrs = [[0 for _ in self.up_weights]]
             down_scale_ptrs = [[0 for _ in self.down_weights]]
         else:
-            gate_scale_ptrs = [[t.data_ptr() for t in self.gate_scales]]
-            up_scale_ptrs = [[t.data_ptr() for t in self.up_scales]]
-            down_scale_ptrs = [[t.data_ptr() for t in self.down_scales]]
+            gate_scale_ptrs = [
+                [0 if t is None else t.data_ptr() for t in self.gate_scales]
+            ]
+            up_scale_ptrs = [
+                [0 if t is None else t.data_ptr() for t in self.up_scales]
+            ]
+            down_scale_ptrs = [
+                [0 if t is None else t.data_ptr() for t in self.down_scales]
+            ]
         t3 = time.time()
 
         moe_config = MOEConfig(
@@ -832,7 +869,10 @@ class NativeMoEWrapper(BaseMoEWrapper):
         elif self.method == "MXFP4":
             # MXFP4: E2M1 nibble-packed weights, ue8m0/bf16 per-32 group scale
             # (e.g. DeepSeek-V4-Flash routed experts)
-            group_size = self.hidden_size // self.gate_scales[0].shape[1]
+            first_gate_scale = next(
+                scale for scale in self.gate_scales if scale is not None
+            )
+            group_size = self.hidden_size // first_gate_scale.shape[1]
             moe_config.quant_config.bits = 4
             moe_config.quant_config.group_size = group_size
             moe_config.quant_config.zero_point = False

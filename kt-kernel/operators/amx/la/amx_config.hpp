@@ -105,12 +105,12 @@ const int AMX_BLK_SIZE = 32;
 #define TMM7 7
 
 inline bool enable_amx() {
-  // CHECK: whether this can be removed?
-  // static thread_local bool initialized = false;
-  // if (initialized) {
-  //   return true;
-  // }
-  // initialized = true;
+  // XTILEDATA permission is thread-local on Linux. Worker-pool threads are
+  // persistent, so cache only successful requests and avoid two arch_prctl
+  // syscalls for every AMX task. Failures are deliberately not cached: a
+  // caller may retry after the host/container policy changes.
+  static thread_local bool initialized = false;
+  if (initialized) return true;
 
   // if (syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA)) {
   //   printf("\n Fail to do XFEATURE_XTILEDATA \n\n");
@@ -128,7 +128,10 @@ inline bool enable_amx() {
     unsigned long bitmask = 0;
     long status = syscall(SYS_arch_prctl, ARCH_GET_XCOMP_PERM, &bitmask);
     if (0 != status) return false;
-    if (bitmask & XFEATURE_MASK_XTILEDATA) return true;
+    if (bitmask & XFEATURE_MASK_XTILEDATA) {
+      initialized = true;
+      return true;
+    }
 
     status = syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA);
     if (0 != status) return false;  // XFEATURE_XTILEDATA setup is failed, TMUL usage is not allowed
@@ -139,6 +142,7 @@ inline bool enable_amx() {
 
     // XFEATURE_XTILEDATA set successfully, TMUL usage is allowed
     // printf("\n TILE DATA USE SET - OK \n\n");
+    initialized = true;
     return true;
   }
   return false;

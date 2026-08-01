@@ -23,9 +23,9 @@ validation_iter = 3
 k_group_size = 32
 debug_print_count = 16
 
-# Forward dispatch in do_gate_up_gemm uses `qlen > 4 * expert_num / top_k`
-# (= 8 with these constants), so qlen=1 hits mat-vec and qlen=32 hits the
-# mat-mat 4×4 register tile (per-expert avg m = qlen*top_k/expert_num = 16).
+# qlen=1 validates the AVX512 latency tail. qlen=32 routes about 16 tokens to
+# each expert and therefore validates the native MXFP4 AMX-BF16 tile path at
+# the default KT_MXFP4_AMX_MIN_TOKENS_PER_EXPERT=4 crossover.
 QLEN_LIST = [1, 32]
 DISPATCH_THRESHOLD = 4 * expert_num / num_experts_per_tok
 
@@ -333,6 +333,10 @@ def run_case(pattern: str, qlen: int) -> Dict[str, float]:
 
 
 def run_fp4_moe_test():
+    print(
+        "Compiled native MXFP4 AMX-BF16 support:",
+        bool(getattr(kt_kernel_ext.moe, "HAS_AMX_BF16", False)),
+    )
     summary_rows = []
     for qlen in QLEN_LIST:
         path = "mat-vec" if qlen <= DISPATCH_THRESHOLD else "mat-mat"

@@ -8,11 +8,14 @@
  * Based on k2-moe.hpp (RAWINT4). Key differences from RAWINT4:
  *   Weight:   FP4 E2M1 (nibble-packed, same layout) → PSHUFB lookup → BF16
  *   Act:      BF16 direct (BufferABF16Impl, no online INT8 quantization)
- *   Dot prod: _mm512_dpbf16_ps (BF16×BF16→FP32) instead of _mm512_dpbssd_epi32
+ *   Dot prod: native AMX-BF16 tiles for multi-token experts, AVX512-BF16
+ *             for latency-sensitive tails (never an INT4 dot product)
  *   Scale:    FP32 per-group scale (weight only, no activation scale)
  **/
 #ifndef CPUINFER_OPERATOR_AMX_FP4_MOE_H
 #define CPUINFER_OPERATOR_AMX_FP4_MOE_H
+
+#include <cstdlib>
 
 #include "la/amx_raw_buffers.hpp"  // BufferABF16Impl
 #include "moe_base.hpp"
@@ -20,7 +23,14 @@
 namespace amx {
 
 // ============================================================================
-// MXFP4 kernel: FP4 E2M1 weights × BF16 activations → FP32 output (AVX512)
+// MXFP4 kernel: FP4 E2M1 weights × BF16 activations → FP32 output.
+//
+// We deliberately keep the model's native nibble-packed E2M1 representation.
+// The AMX path expands one 16x32 weight tile at a time into a small VNNI BF16
+// scratch tile.  It does *not* materialize a BF16 copy of the model and does
+// not reinterpret the values as integers.  Each UE8M0 group scale is applied
+// in FP32 after the corresponding K=32 tile dot product, matching the AVX512
+// path's quantization semantics.
 // ============================================================================
 struct GemmKernel224MXFP4SmallKGroup {
   using dt = uint8_t;
@@ -34,14 +44,66 @@ struct GemmKernel224MXFP4SmallKGroup {
   static inline const int N_BLOCK = 256;
   static inline const int K_BLOCK = 7168;
 
-  static std::string name() { return "MXFP4_KGROUP"; }
+  static constexpr int TILE_M = 16;
+  static constexpr int TILE_N = 16;
+  static constexpr int TILE_K = 32;
+  static constexpr int VNNI_BLK = 2;
+
+  static std::string name() { return "MXFP4_NATIVE_AMX_BF16"; }
   static int recommended_nth(int n) { return (n + N_BLOCK - 1) / N_BLOCK; }
   static std::pair<int, int> split_range_n(int n, int ith, int nth) {
     int n_start = N_BLOCK * ith;
     int n_end = std::min(n, N_BLOCK * (ith + 1));
     return {n_start, n_end};
   }
-  static void config() {}
+  static void config() {
+#ifdef HAVE_AMX
+    if (!enable_amx()) {
+      throw std::runtime_error(
+          "MXFP4 AMX-BF16 was compiled in, but Linux did not grant XTILEDATA permission");
+    }
+    TileConfig tile_config;
+    tile_config.set_row_col(0, TILE_M, TILE_K * sizeof(ggml_bf16_t));
+    for (int tile = 1; tile <= 2; ++tile) {
+      tile_config.set_row_col(tile, TILE_K / VNNI_BLK,
+                              TILE_N * VNNI_BLK * sizeof(ggml_bf16_t));
+    }
+    for (int tile = 3; tile <= 4; ++tile) {
+      tile_config.set_row_col(tile, TILE_M, TILE_N * sizeof(float));
+    }
+    tile_config.set_config();
+#endif
+  }
+
+  // Expert batches below this size remain on the AVX512-BF16 microkernel: the
+  // fixed 16-row AMX tile and FP4 expansion cost dominate tiny decode batches.
+  // Set to 0 to force AMX for validation/benchmarking.
+  static int amx_min_tokens_per_expert() {
+    static const int threshold = [] {
+      constexpr int default_threshold = 4;
+      const char* value = std::getenv("KT_MXFP4_AMX_MIN_TOKENS_PER_EXPERT");
+      if (value == nullptr || *value == '\0') return default_threshold;
+      char* end = nullptr;
+      long parsed = std::strtol(value, &end, 10);
+      if (end == value || *end != '\0' || parsed < 0 || parsed > 1024) {
+        throw std::runtime_error(
+            "KT_MXFP4_AMX_MIN_TOKENS_PER_EXPERT must be an integer in [0, 1024]");
+      }
+      return static_cast<int>(parsed);
+    }();
+    return threshold;
+  }
+
+  static bool should_use_amx(int m, int k_group_size) {
+#ifdef HAVE_AMX
+    // DeepSeek-V4-Flash uses one native UE8M0 scale per 32 E2M1 values.
+    return k_group_size == TILE_K && m >= amx_min_tokens_per_expert();
+#else
+    (void)m;
+    (void)k_group_size;
+    return false;
+#endif
+  }
 
   // FP4 E2M1 → BF16 LUTs (16 entries each, for PSHUFB within 128-bit lanes)
   // E2M1 values: {0, ±0.5, ±1.0, ±1.5, ±2.0, ±3.0, ±4.0, ±6.0}
@@ -138,10 +200,140 @@ struct GemmKernel224MXFP4SmallKGroup {
 #endif
   }
 
-  // Buffers
+  // Buffers retain native packed MXFP4 weights.  These aliases must precede
+  // the AMX helper declarations that consume them.
   using BufferA = BufferABF16Impl<GemmKernel224MXFP4SmallKGroup>;        // raw BF16, no quant
-  using BufferB = BufferBInt4KGroupImpl<GemmKernel224MXFP4SmallKGroup>;  // nibble-packed FP4
+  using BufferB = BufferBInt4KGroupImpl<GemmKernel224MXFP4SmallKGroup>;  // nibble-packed E2M1
   using BufferC = BufferCReduceImpl<GemmKernel224MXFP4SmallKGroup>;      // FP32 reduce
+
+#ifdef HAVE_AMX
+  struct alignas(64) AMXScratch {
+    ggml_bf16_t a[TILE_M * TILE_K];
+    ggml_bf16_t b[N_STEP * TILE_K];
+    float partial[TILE_M * N_STEP];
+    float accum[TILE_M * N_BLOCK];
+  };
+
+  // Decode N output-channel rows without applying their per-group scale.  The
+  // 16x32 row-major BF16 tile is then transposed as 16x16 dwords into the VNNI
+  // layout required by TDPBF16PS.
+  static inline void prepare_amx_b_tile(BufferB* bb, int n, int k, int n_begin,
+                                        int k_begin, int valid_n,
+                                        ggml_bf16_t* dst) {
+    std::memset(dst, 0, sizeof(ggml_bf16_t) * TILE_N * TILE_K);
+    for (int ni = 0; ni < valid_n; ++ni) {
+      const __m128i packed = _mm_loadu_si128(
+          reinterpret_cast<const __m128i*>(bb->get_submat(n, k, n_begin + ni, k_begin)));
+      _mm512_store_si512(reinterpret_cast<__m512i*>(dst + ni * TILE_K),
+                         mxfp4_to_bf16_32(packed));
+    }
+    transpose_16x16_32bit(reinterpret_cast<__m512i*>(dst));
+  }
+
+  // Native MXFP4 AMX-BF16 GEMM.  Accumulation is deliberately split at every
+  // K=32 MX group: AMX produces the unscaled FP32 partial, then an AVX512 FMA
+  // applies the 16 independent output-channel scales.  This avoids rounding a
+  // scale into BF16 and is numerically equivalent to the existing native
+  // MXFP4 microkernel apart from the dot-product reduction order.
+  static void fp4_mat_mat_amx(int m, int n, int k, BufferA* ba, BufferB* bb,
+                              BufferC* bc, int ith, int nth) {
+    auto [n_start, n_end] = split_range_n(n, ith, nth);
+    if (n_start >= n_end) return;
+
+    AMXScratch scratch;
+    alignas(64) float scales[N_STEP];
+
+    for (int m_begin = 0; m_begin < m; m_begin += TILE_M) {
+      const int valid_m = std::min(TILE_M, m - m_begin);
+      const int panel_n = n_end - n_start;
+      std::memset(scratch.accum, 0,
+                  sizeof(float) * TILE_M * N_BLOCK);
+
+      // The thread's N panel is at most N_BLOCK=256 columns. Accumulate its
+      // scaled K=32 partials in a 16 KiB FP32 scratch panel, then write C once.
+      // This retains A reuse across eight N_STEP tiles without turning every
+      // MX group into a read-modify-write pass over the output buffer.
+      for (int k_begin = 0; k_begin < k; k_begin += TILE_K) {
+        if (valid_m == TILE_M) {
+          const int k_block_begin = k_begin / K_BLOCK * K_BLOCK;
+          const int k_block_size = std::min(K_BLOCK, k - k_block_begin);
+          _tile_loadd(0, ba->get_submat(m, k, m_begin, k_begin),
+                      k_block_size * sizeof(ggml_bf16_t));
+        } else {
+          std::memset(scratch.a, 0, sizeof(scratch.a));
+          for (int mi = 0; mi < valid_m; ++mi) {
+            const ggml_bf16_t* src =
+                ba->get_submat(m, k, m_begin + mi, k_begin);
+            _mm512_store_si512(
+                reinterpret_cast<__m512i*>(scratch.a + mi * TILE_K),
+                _mm512_loadu_si512(reinterpret_cast<const __m512i*>(src)));
+          }
+          _tile_loadd(0, scratch.a, TILE_K * sizeof(ggml_bf16_t));
+        }
+
+        for (int n_begin = n_start; n_begin < n_end; n_begin += N_STEP) {
+          const int valid_n = std::min(N_STEP, n_end - n_begin);
+          const int valid_n0 = std::min(TILE_N, valid_n);
+          const int valid_n1 = std::max(0, valid_n - TILE_N);
+          prepare_amx_b_tile(bb, n, k, n_begin, k_begin, valid_n0, scratch.b);
+          prepare_amx_b_tile(bb, n, k, n_begin + TILE_N, k_begin, valid_n1,
+                             scratch.b + TILE_N * TILE_K);
+
+          _tile_zero(3);
+          _tile_zero(4);
+          _tile_loadd(1, scratch.b,
+                      TILE_N * VNNI_BLK * sizeof(ggml_bf16_t));
+          _tile_loadd(2, scratch.b + TILE_N * TILE_K,
+                      TILE_N * VNNI_BLK * sizeof(ggml_bf16_t));
+          _tile_dpbf16ps(3, 0, 1);
+          _tile_dpbf16ps(4, 0, 2);
+          _tile_stored(3, scratch.partial, N_STEP * sizeof(float));
+          _tile_stored(4, scratch.partial + TILE_N, N_STEP * sizeof(float));
+
+          for (int ni = 0; ni < valid_n; ++ni) {
+            scales[ni] = *bb->get_scale(n, n_begin + ni, k, k_begin);
+          }
+          for (int ni = valid_n; ni < N_STEP; ++ni) scales[ni] = 0.0f;
+          const __m512 scale0 = _mm512_load_ps(scales);
+          const __m512 scale1 = _mm512_load_ps(scales + TILE_N);
+
+          for (int mi = 0; mi < valid_m; ++mi) {
+            float* accum = scratch.accum + mi * N_BLOCK + (n_begin - n_start);
+            if (valid_n == N_STEP) {
+              const __m512 old0 = _mm512_load_ps(accum);
+              const __m512 old1 = _mm512_load_ps(accum + TILE_N);
+              const __m512 part0 = _mm512_load_ps(scratch.partial + mi * N_STEP);
+              const __m512 part1 =
+                  _mm512_load_ps(scratch.partial + mi * N_STEP + TILE_N);
+              _mm512_store_ps(accum, _mm512_fmadd_ps(part0, scale0, old0));
+              _mm512_store_ps(accum + TILE_N,
+                              _mm512_fmadd_ps(part1, scale1, old1));
+            } else {
+              for (int ni = 0; ni < valid_n; ++ni) {
+                accum[ni] += scratch.partial[mi * N_STEP + ni] * scales[ni];
+              }
+            }
+          }
+        }
+      }
+
+      for (int mi = 0; mi < valid_m; ++mi) {
+        float* output = bc->get_submat(m, n, m_begin + mi, n_start);
+        const float* accum = scratch.accum + mi * N_BLOCK;
+        for (int ni = 0; ni < panel_n; ni += N_STEP) {
+          const int valid_n = std::min(N_STEP, panel_n - ni);
+          if (valid_n == N_STEP) {
+            _mm512_storeu_ps(output + ni, _mm512_load_ps(accum + ni));
+            _mm512_storeu_ps(output + ni + TILE_N,
+                             _mm512_load_ps(accum + ni + TILE_N));
+          } else {
+            std::copy(accum + ni, accum + ni + valid_n, output + ni);
+          }
+        }
+      }
+    }
+  }
+#endif
 
   // 4 个 zmm 的 horizontal reduce → 4 个连续 fp32。
   // 4 次 reduce_add_ps 之间无依赖，编译器/CPU 可并行调度。
@@ -337,14 +529,26 @@ inline void vec_mul_kgroup(int m, int n, int k, int k_group_size,
                            std::shared_ptr<GemmKernel224MXFP4SmallKGroup::BufferA> ba,
                            std::shared_ptr<GemmKernel224MXFP4SmallKGroup::BufferB> bb,
                            std::shared_ptr<GemmKernel224MXFP4SmallKGroup::BufferC> bc, int ith, int nth) {
-  GemmKernel224MXFP4SmallKGroup::fp4_mat_vec_kgroup(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith, nth);
+  if (GemmKernel224MXFP4SmallKGroup::should_use_amx(m, k_group_size)) {
+#ifdef HAVE_AMX
+    GemmKernel224MXFP4SmallKGroup::fp4_mat_mat_amx(m, n, k, ba.get(), bb.get(), bc.get(), ith, nth);
+#endif
+  } else {
+    GemmKernel224MXFP4SmallKGroup::fp4_mat_vec_kgroup(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith, nth);
+  }
 }
 
 inline void mat_mul_kgroup(int m, int n, int k, int k_group_size,
                            std::shared_ptr<GemmKernel224MXFP4SmallKGroup::BufferA> ba,
                            std::shared_ptr<GemmKernel224MXFP4SmallKGroup::BufferB> bb,
                            std::shared_ptr<GemmKernel224MXFP4SmallKGroup::BufferC> bc, int ith, int nth) {
-  GemmKernel224MXFP4SmallKGroup::fp4_mat_mat_kgroup(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith, nth);
+  if (GemmKernel224MXFP4SmallKGroup::should_use_amx(m, k_group_size)) {
+#ifdef HAVE_AMX
+    GemmKernel224MXFP4SmallKGroup::fp4_mat_mat_amx(m, n, k, ba.get(), bb.get(), bc.get(), ith, nth);
+#endif
+  } else {
+    GemmKernel224MXFP4SmallKGroup::fp4_mat_mat_kgroup(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith, nth);
+  }
 }
 
 }  // namespace amx
@@ -379,7 +583,11 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     if (quant_config.group_size == 0 || quant_config.zero_point) {
       throw std::runtime_error("MXFP4 MoE only supports KGroup FP4");
     }
-    printf("Creating AMX_FP4_MOE_TP %d at numa %d\n", tp_part_idx, numa_node_of_cpu(sched_getcpu()));
+    constexpr const char* backend = amx::AMX_AVAILABLE ? "native-MXFP4/AMX-BF16+AVX512-tail"
+                                                       : "native-MXFP4/AVX512-BF16";
+    printf("Creating AMX_FP4_MOE_TP %d at numa %d (backend=%s, amx_min_tokens=%d)\n",
+           tp_part_idx, numa_node_of_cpu(sched_getcpu()), backend,
+           T::amx_min_tokens_per_expert());
   }
 
   ~AMX_FP4_MOE_TP() = default;
@@ -715,30 +923,52 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
         pool->get_subpool(i)->do_work_stealing_job(
             tpc.expert_num, nullptr,
             [&, i](int expert_id_) {
-              size_t expert_id = expert_map(physical_to_logical_map, expert_id_);
+              const size_t physical_expert_id = expert_id_;
+              const size_t logical_expert_id =
+                  expert_map(physical_to_logical_map, physical_expert_id);
 
-              uint8_t* src_gate = (uint8_t*)config.gate_projs[0][expert_id];
-              uint8_t* src_up = (uint8_t*)config.up_projs[0][expert_id];
-              uint8_t* src_down = (uint8_t*)config.down_projs[0][expert_id];
-              ggml_bf16_t* src_gate_scale = (ggml_bf16_t*)config.gate_scales[0][expert_id];
-              ggml_bf16_t* src_up_scale = (ggml_bf16_t*)config.up_scales[0][expert_id];
-              ggml_bf16_t* src_down_scale = (ggml_bf16_t*)config.down_scales[0][expert_id];
+              if (logical_expert_id >= config.gate_projs[0].size() ||
+                  config.gate_projs[0][logical_expert_id] == nullptr ||
+                  config.up_projs[0][logical_expert_id] == nullptr ||
+                  config.down_projs[0][logical_expert_id] == nullptr ||
+                  config.gate_scales[0][logical_expert_id] == nullptr ||
+                  config.up_scales[0][logical_expert_id] == nullptr ||
+                  config.down_scales[0][logical_expert_id] == nullptr) {
+                throw std::runtime_error(
+                    "MXFP4 compact load received a missing checkpoint pointer for logical expert " +
+                    std::to_string(logical_expert_id));
+              }
 
-              memcpy((uint8_t*)tpc.gate_proj + ((expert_id * weight_elem_count) >> 1),
+              uint8_t* src_gate =
+                  (uint8_t*)config.gate_projs[0][logical_expert_id];
+              uint8_t* src_up =
+                  (uint8_t*)config.up_projs[0][logical_expert_id];
+              uint8_t* src_down =
+                  (uint8_t*)config.down_projs[0][logical_expert_id];
+              ggml_bf16_t* src_gate_scale =
+                  (ggml_bf16_t*)config.gate_scales[0][logical_expert_id];
+              ggml_bf16_t* src_up_scale =
+                  (ggml_bf16_t*)config.up_scales[0][logical_expert_id];
+              ggml_bf16_t* src_down_scale =
+                  (ggml_bf16_t*)config.down_scales[0][logical_expert_id];
+
+              memcpy((uint8_t*)tpc.gate_proj + ((physical_expert_id * weight_elem_count) >> 1),
                      src_gate + ((i * weight_elem_count) >> 1), (weight_elem_count >> 1));
-              memcpy((uint8_t*)tpc.up_proj + ((expert_id * weight_elem_count) >> 1),
+              memcpy((uint8_t*)tpc.up_proj + ((physical_expert_id * weight_elem_count) >> 1),
                      src_up + ((i * weight_elem_count) >> 1), (weight_elem_count >> 1));
-              memcpy((ggml_bf16_t*)tpc.gate_scale + (expert_id * scales_elem_count),
+              memcpy((ggml_bf16_t*)tpc.gate_scale + (physical_expert_id * scales_elem_count),
                      src_gate_scale + (i * scales_elem_count), sizeof(ggml_bf16_t) * scales_elem_count);
-              memcpy((ggml_bf16_t*)tpc.up_scale + (expert_id * scales_elem_count),
+              memcpy((ggml_bf16_t*)tpc.up_scale + (physical_expert_id * scales_elem_count),
                      src_up_scale + (i * scales_elem_count), sizeof(ggml_bf16_t) * scales_elem_count);
 
               for (size_t col = 0; col < config.hidden_size; col++) {
-                memcpy((uint8_t*)tpc.down_proj + ((expert_id * weight_elem_count + col * tpc.intermediate_size) >> 1),
+                memcpy((uint8_t*)tpc.down_proj +
+                           ((physical_expert_id * weight_elem_count + col * tpc.intermediate_size) >> 1),
                        src_down + ((col * config.intermediate_size + i * tpc.intermediate_size) >> 1),
                        (tpc.intermediate_size >> 1));
                 memcpy((ggml_bf16_t*)tpc.down_scale +
-                           (expert_id * scales_elem_count + col * (tpc.intermediate_size / group_size)),
+                           (physical_expert_id * scales_elem_count +
+                            col * (tpc.intermediate_size / group_size)),
                        src_down_scale +
                            (col * (config.intermediate_size / group_size) + i * (tpc.intermediate_size / group_size)),
                        sizeof(ggml_bf16_t) * (tpc.intermediate_size / group_size));
@@ -791,7 +1021,16 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
       printf("TP %d load weight done.\n", i);
     });
 
-    DO_TPS_LOAD_WEIGHTS(pool);
+    if (use_per_expert_ptrs) {
+      // The staging arrays above are already packed in compact physical expert
+      // order. Do not apply the checkpoint logical-id map a second time.
+      pool->dispense_backend()->do_numa_job([&, this](int numa_id) {
+        tps[numa_id]->config_.physical_to_logical_map = nullptr;
+        tps[numa_id]->load_weights();
+      });
+    } else {
+      DO_TPS_LOAD_WEIGHTS(pool);
+    }
 
     pool->dispense_backend()->do_numa_job([&, this](int i) {
       auto& tpc = tps[i]->config_;
