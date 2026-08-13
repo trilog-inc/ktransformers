@@ -16,6 +16,7 @@ from .loader import (
     BF16SafeTensorLoader,
     GPTQSafeTensorLoader,
     MXFP4SafeTensorLoader,
+    NVFP4SafeTensorLoader,
     MXFP8SafeTensorLoader,
 )
 from kt_kernel_ext.moe import MOEConfig
@@ -25,6 +26,7 @@ AMXInt4_MOE = getattr(_moe_mod, "AMXInt4_MOE", None)
 AMXInt8_MOE = getattr(_moe_mod, "AMXInt8_MOE", None)
 AMXInt4_KGroup_MOE = getattr(_moe_mod, "AMXInt4_KGroup_MOE", None)
 AMXFP4_KGroup_MOE = getattr(_moe_mod, "AMXFP4_KGroup_MOE", None)
+AMXMXFP4UE8M0_KGroup_MOE = getattr(_moe_mod, "AMXMXFP4UE8M0_KGroup_MOE", None)
 AMXMXFP8_KGroup_MOE = getattr(_moe_mod, "AMXMXFP8_KGroup_MOE", None)
 AMXFP8_MOE = getattr(_moe_mod, "AMXFP8_MOE", None)
 AMXBF16_MOE = getattr(_moe_mod, "AMXBF16_MOE", None)
@@ -34,6 +36,7 @@ AVX2FP8_MOE = getattr(_moe_mod, "AVX2FP8_MOE", None)
 AVX2GPTQInt4_MOE = getattr(_moe_mod, "AVX2GPTQInt4_MOE", None)
 AVX2RawInt4_MOE = getattr(_moe_mod, "AVX2RawInt4_MOE", None)
 AVX2MXFP4_MOE = getattr(_moe_mod, "AVX2MXFP4_MOE", None)
+AVX2MXFP4UE8M0_MOE = getattr(_moe_mod, "AVX2MXFP4UE8M0_MOE", None)
 AVX2MXFP8_MOE = getattr(_moe_mod, "AVX2MXFP8_MOE", None)
 AVXVNNI256GPTQInt4_MOE = getattr(_moe_mod, "AVXVNNI256GPTQInt4_MOE", None)
 AVXVNNI256RawInt4_MOE = getattr(_moe_mod, "AVXVNNI256RawInt4_MOE", None)
@@ -41,7 +44,7 @@ AVXVNNI256RawInt4_MOE = getattr(_moe_mod, "AVXVNNI256RawInt4_MOE", None)
 _HAS_AMXINT4_SUPPORT = AMXInt4_MOE is not None
 _HAS_AMXINT8_SUPPORT = AMXInt8_MOE is not None
 _HAS_RAWINT4_SUPPORT = AMXInt4_KGroup_MOE is not None
-_HAS_MXFP4_SUPPORT = AMXFP4_KGroup_MOE is not None
+_HAS_MXFP4_SUPPORT = AMXMXFP4UE8M0_KGroup_MOE is not None
 _HAS_MXFP8_SUPPORT = AMXMXFP8_KGroup_MOE is not None
 _HAS_FP8_SUPPORT = AMXFP8_MOE is not None
 _HAS_BF16_SUPPORT = AMXBF16_MOE is not None
@@ -50,7 +53,7 @@ _HAS_AVX2_BF16_SUPPORT = AVX2BF16_MOE is not None
 _HAS_AVX2_FP8_SUPPORT = AVX2FP8_MOE is not None
 _HAS_AVX2_GPTQ_INT4_SUPPORT = AVX2GPTQInt4_MOE is not None
 _HAS_AVX2_RAWINT4_SUPPORT = AVX2RawInt4_MOE is not None
-_HAS_AVX2_MXFP4_SUPPORT = AVX2MXFP4_MOE is not None
+_HAS_AVX2_MXFP4_SUPPORT = AVX2MXFP4UE8M0_MOE is not None
 _HAS_AVX2_MXFP8_SUPPORT = AVX2MXFP8_MOE is not None
 _HAS_AVXVNNI256_GPTQ_INT4_SUPPORT = AVXVNNI256GPTQInt4_MOE is not None
 _HAS_AVXVNNI256_RAW_INT4_SUPPORT = AVXVNNI256RawInt4_MOE is not None
@@ -161,24 +164,60 @@ def _select_mxfp4_backend():
     if forced == "amx":
         if not _HAS_MXFP4_SUPPORT:
             raise RuntimeError(
-                "KT_MXFP4_BACKEND=amx requested, but AMXFP4_KGroup_MOE is not compiled in. "
+                "KT_MXFP4_BACKEND=amx requested, but AMXMXFP4UE8M0_KGroup_MOE is not compiled in. "
+                "Recompile with AVX512F + AVX512BW + AVX512_BF16 enabled."
+            )
+        return AMXMXFP4UE8M0_KGroup_MOE
+
+    if forced == "avx2":
+        if not _HAS_AVX2_MXFP4_SUPPORT:
+            raise RuntimeError(
+                "KT_MXFP4_BACKEND=avx2 requested, but AVX2MXFP4UE8M0_MOE is not compiled in. "
+                "Recompile with AVX2 + FMA enabled."
+            )
+        return AVX2MXFP4UE8M0_MOE
+
+    if _HAS_MXFP4_SUPPORT:
+        return AMXMXFP4UE8M0_KGroup_MOE
+    if _HAS_AVX2_MXFP4_SUPPORT:
+        return AVX2MXFP4UE8M0_MOE
+    return None
+
+
+def _select_nvfp4_backend(group_size: int):
+    """Select an FP4 backend for NVFP4.
+
+    NVFP4 commonly uses per-16 block scales. Default to AMX so
+    performance-sensitive launches stay on the fast path; AVX2 remains
+    available when requested explicitly.
+    """
+    forced = os.getenv("KT_NVFP4_BACKEND", os.getenv("KT_MXFP4_BACKEND", "amx")).strip().lower()
+
+    if forced == "amx":
+        if group_size != 16 and group_size % 32 != 0:
+            raise RuntimeError(
+                "NVFP4 AMX backend supports group_size=16 or multiples of 32; "
+                f"got group_size={group_size}. Set KT_NVFP4_BACKEND=avx2 for "
+                "other group sizes."
+            )
+        if AMXFP4_KGroup_MOE is None:
+            raise RuntimeError(
+                "KT_NVFP4_BACKEND=amx requested, but AMXFP4_KGroup_MOE is not compiled in. "
                 "Recompile with AVX512F + AVX512BW + AVX512_BF16 enabled."
             )
         return AMXFP4_KGroup_MOE
 
     if forced == "avx2":
-        if not _HAS_AVX2_MXFP4_SUPPORT:
+        if AVX2MXFP4_MOE is None:
             raise RuntimeError(
-                "KT_MXFP4_BACKEND=avx2 requested, but AVX2MXFP4_MOE is not compiled in. "
+                "KT_NVFP4_BACKEND=avx2 requested, but AVX2MXFP4_MOE is not compiled in. "
                 "Recompile with AVX2 + FMA enabled."
             )
         return AVX2MXFP4_MOE
 
-    if _HAS_MXFP4_SUPPORT:
-        return AMXFP4_KGroup_MOE
-    if _HAS_AVX2_MXFP4_SUPPORT:
-        return AVX2MXFP4_MOE
-    return None
+    raise RuntimeError(
+        f"Unsupported KT_NVFP4_BACKEND={forced!r}. Use 'amx' (default) or 'avx2'."
+    )
 
 
 def _select_mxfp8_backend():
@@ -597,6 +636,13 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 "  - AVX2 + FMA (for AVX2 fallback backend)\n"
                 "Please recompile kt_kernel_ext with one of the above enabled."
             )
+        if method == "NVFP4" and not (_HAS_MXFP4_SUPPORT or _HAS_AVX2_MXFP4_SUPPORT):
+            raise RuntimeError(
+                "NVFP4 backend not available. Required ISA (any one of):\n"
+                "  - AVX512F + AVX512BW + AVX512_BF16 for AMX/AVX-512 backend\n"
+                "  - AVX2 + FMA for group_size=16/32 fallback backend\n"
+                "Please recompile kt_kernel_ext with one of the above enabled."
+            )
         if method == "MXFP8" and not (_HAS_MXFP8_SUPPORT or _HAS_AVX2_MXFP8_SUPPORT):
             raise RuntimeError(
                 "MXFP8 backend not available. Required ISA (any one of):\n"
@@ -633,6 +679,9 @@ class NativeMoEWrapper(BaseMoEWrapper):
         self.gate_scales = None
         self.up_scales = None
         self.down_scales = None
+        self.gate_raw_scales = None
+        self.up_raw_scales = None
+        self.down_raw_scales = None
 
     @staticmethod
     def _create_loader(method: str, weight_path: str):
@@ -648,6 +697,8 @@ class NativeMoEWrapper(BaseMoEWrapper):
             return GPTQSafeTensorLoader(weight_path)
         elif method == "MXFP4":
             return MXFP4SafeTensorLoader(weight_path)
+        elif method == "NVFP4":
+            return NVFP4SafeTensorLoader(weight_path)
         elif method == "MXFP8":
             return MXFP8SafeTensorLoader(weight_path)
         else:
@@ -737,6 +788,10 @@ class NativeMoEWrapper(BaseMoEWrapper):
             self.gate_scales = weights["gate_scale"]
             self.up_scales = weights["up_scale"]
             self.down_scales = weights["down_scale"]
+            if self.method == "NVFP4":
+                self.gate_raw_scales = weights["gate_raw_scale"]
+                self.up_raw_scales = weights["up_raw_scale"]
+                self.down_raw_scales = weights["down_raw_scale"]
             if self.method == "RAWINT4":
                 assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 scales for RAWINT4"
             elif self.method == "FP8":
@@ -752,9 +807,10 @@ class NativeMoEWrapper(BaseMoEWrapper):
                     self.down_scales = [t.to(torch.float32).contiguous() for t in weights["down_scale"]]
                 assert self.gate_scales[0].dtype == torch.float32, "Expected float32 scales for FP8_PERCHANNEL"
             elif self.method == "MXFP4":
-                # ue8m0 is losslessly representable in bf16 (8-bit exponent, 0 mantissa);
-                # the loader has already done that conversion.
-                assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 scales for MXFP4"
+                assert self.gate_scales[0].dtype == torch.uint8, "Expected native uint8 UE8M0 scales for MXFP4"
+            elif self.method == "NVFP4":
+                assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 CPU scales for NVFP4"
+                assert self.gate_raw_scales[0].dtype == torch.uint8, "Expected uint8 raw FP8 scales for NVFP4"
             elif self.method == "MXFP8":
                 # ue8m0 scales stay as uint8; C++ convert_ue8m0_to_fp32 handles conversion.
                 assert self.gate_scales[0].dtype == torch.uint8, "Expected uint8 (ue8m0) scales for MXFP8"
@@ -776,6 +832,14 @@ class NativeMoEWrapper(BaseMoEWrapper):
             gate_scale_ptrs = [[t.data_ptr() for t in self.gate_scales]]
             up_scale_ptrs = [[t.data_ptr() for t in self.up_scales]]
             down_scale_ptrs = [[t.data_ptr() for t in self.down_scales]]
+        if self.method == "NVFP4":
+            gate_raw_scale_ptrs = [[t.data_ptr() for t in self.gate_raw_scales]]
+            up_raw_scale_ptrs = [[t.data_ptr() for t in self.up_raw_scales]]
+            down_raw_scale_ptrs = [[t.data_ptr() for t in self.down_raw_scales]]
+        else:
+            gate_raw_scale_ptrs = []
+            up_raw_scale_ptrs = []
+            down_raw_scale_ptrs = []
         t3 = time.time()
 
         moe_config = MOEConfig(
@@ -810,6 +874,9 @@ class NativeMoEWrapper(BaseMoEWrapper):
         moe_config.gate_scales = gate_scale_ptrs
         moe_config.up_scales = up_scale_ptrs
         moe_config.down_scales = down_scale_ptrs
+        moe_config.gate_zeros = gate_raw_scale_ptrs
+        moe_config.up_zeros = up_raw_scale_ptrs
+        moe_config.down_zeros = down_raw_scale_ptrs
 
         # Infer group_size from scale shape (column-major layout)
         # For gate/up projection: in_features = hidden_size
@@ -834,6 +901,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
             # (e.g. DeepSeek-V4-Flash routed experts)
             group_size = self.hidden_size // self.gate_scales[0].shape[1]
             moe_config.quant_config.bits = 4
+            moe_config.quant_config.quant_method = "MXFP4"
             moe_config.quant_config.group_size = group_size
             moe_config.quant_config.zero_point = False
             backend_cls = _select_mxfp4_backend()
@@ -843,11 +911,29 @@ class NativeMoEWrapper(BaseMoEWrapper):
                     "Compile with AVX512_BF16 (AMXFP4_KGroup_MOE) or AVX2 (AVX2MXFP4_MOE)."
                 )
             self.moe = backend_cls(moe_config)
+        elif self.method == "NVFP4":
+            # NVFP4: E2M1 nibble-packed weights, FP8 E4M3 per-block scale.
+            # The loader folds the per-tensor weight scale into BF16 CPU scales;
+            # raw FP8 block scales are carried through gate/up/down_zeros for
+            # exact SGLang GPU fallback uploads.
+            group_size = self.hidden_size // self.gate_scales[0].shape[1]
+            moe_config.quant_config.bits = 4
+            moe_config.quant_config.quant_method = "NVFP4"
+            moe_config.quant_config.group_size = group_size
+            moe_config.quant_config.zero_point = False
+            backend_cls = _select_nvfp4_backend(group_size)
+            if backend_cls is None:
+                raise RuntimeError(
+                    "No NVFP4 backend available after runtime selection. "
+                    "Compile with AVX512_BF16 for AMX support or AVX2 for fallback support."
+                )
+            self.moe = backend_cls(moe_config)
         elif self.method == "MXFP8":
             # MXFP8: FP8 E4M3fn byte weights, ue8m0/uint8 per-32 group scale
             # (e.g. MiniMax-M3-Preview)
             group_size = self.hidden_size // self.gate_scales[0].shape[1]
             moe_config.quant_config.bits = 8
+            moe_config.quant_config.quant_method = "MXFP8"
             moe_config.quant_config.group_size = group_size
             moe_config.quant_config.zero_point = False
             moe_config.swiglu_alpha = getattr(self, "_swiglu_alpha", 0.0)
@@ -907,6 +993,10 @@ class NativeMoEWrapper(BaseMoEWrapper):
             del self.gate_scales
             del self.up_scales
             del self.down_scales
+        if self.gate_raw_scales is not None:
+            del self.gate_raw_scales
+            del self.up_raw_scales
+            del self.down_raw_scales
 
         NativeMoEWrapper._release_loader(layer_idx=self.layer_idx)
         t6 = time.time()

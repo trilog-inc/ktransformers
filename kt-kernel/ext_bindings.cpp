@@ -795,7 +795,12 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   bind_moe_module<AMX_BF16_MOE_TP<amx::GemmKernel224BF16>>(moe_module, "AMXBF16_MOE");
   bind_moe_module<AMX_FP8_MOE_TP<amx::GemmKernel224FP8>>(moe_module, "AMXFP8_MOE");
   bind_moe_module<AMX_FP8_PERCHANNEL_MOE_TP<amx::GemmKernel224FP8PerChannel>>(moe_module, "AMXFP8PerChannel_MOE");
-  bind_moe_module<AMX_FP4_MOE_TP<amx::GemmKernel224MXFP4SmallKGroup>>(moe_module, "AMXFP4_KGroup_MOE");
+  // Keep the legacy FP32-scale class stable for NVFP4 and synthetic callers.
+  // Native MXFP4 gets a dedicated one-byte UE8M0 representation.
+  bind_moe_module<AMX_FP4_MOE_TP<amx::GemmKernel224FP4FP32ScaleSmallKGroup>>(moe_module,
+                                                                            "AMXFP4_KGroup_MOE");
+  bind_moe_module<AMX_FP4_MOE_TP<amx::GemmKernel224MXFP4SmallKGroup>>(moe_module,
+                                                                      "AMXMXFP4UE8M0_KGroup_MOE");
   bind_moe_module<AMX_MXFP8_MOE_TP<amx::GemmKernel224MXFP8SmallKGroup>>(moe_module, "AMXMXFP8_KGroup_MOE");
 #endif
 #if defined(__AVX512BF16__)
@@ -826,7 +831,8 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
   bind_moe_module<AVX2_FP8_MOE_TP<avx2::GemmKernelAVX2FP8>>(moe_module, "AVX2FP8_MOE");
   bind_moe_module<AVX2_GPTQ_INT4_MOE_TP<avx2::GemmKernelAVX2GPTQInt4>>(moe_module, "AVX2GPTQInt4_MOE");
   bind_moe_module<AVX2_RAW_INT4_MOE_TP<avx2::GemmKernelAVX2RawInt4>>(moe_module, "AVX2RawInt4_MOE");
-  bind_moe_module<AVX2_MXFP4_MOE_TP<avx2::GemmKernelAVX2MXFP4>>(moe_module, "AVX2MXFP4_MOE");
+  bind_moe_module<AVX2_MXFP4_MOE_TP<avx2::GemmKernelAVX2FP4FP32Scale>>(moe_module, "AVX2MXFP4_MOE");
+  bind_moe_module<AVX2_MXFP4_MOE_TP<avx2::GemmKernelAVX2MXFP4>>(moe_module, "AVX2MXFP4UE8M0_MOE");
   bind_moe_module<AVX2_MXFP8_MOE_TP<avx2::GemmKernelAVX2MXFP8>>(moe_module, "AVX2MXFP8_MOE");
   bind_moe_module<AVXVNNI256_GPTQ_INT4_MOE_TP<avxvnni::GemmKernelAVXVNNI256GPTQInt4>>(moe_module,
                                                                                       "AVXVNNI256GPTQInt4_MOE");

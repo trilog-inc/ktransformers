@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * MXFP4 stores FP4 E2M1 weights nibble-packed (2 values per byte), plus
- * per-group-32 FP32 scales. This AVX2 backend dequantizes FP4→FP32 via SSSE3
+ * native per-group-32 UE8M0 scales. This AVX2 backend dequantizes FP4→FP32 via SSSE3
  * PSHUFB lookup tables, then accumulates with BF16 activations using
  * _mm256_fmadd_ps. No AVX-512 required.
  *
@@ -24,15 +24,17 @@
 #include "avx2_bf16_gemm.hpp"
 #include "avx2_bf16_utils.hpp"
 #include "moe_base.hpp"
+#include "../mxfp4_ue8m0.hpp"
 
 namespace avx2 {
 
 // ============================================================================
 // AVX2 MXFP4 GemmKernel
-// Weights: FP4 E2M1 nibble-packed, per-group-32 FP32 scales
+// Weights: FP4 E2M1 nibble-packed, per-group-32 UE8M0 scales
 // Activations: BF16; Output: FP32
 // ============================================================================
-struct GemmKernelAVX2MXFP4 {
+template <bool NativeUE8M0 = true>
+struct GemmKernelAVX2MXFP4Impl {
   using dt = uint8_t;
   using output_t = float;
   static constexpr int M_STEP = 1;
@@ -41,11 +43,12 @@ struct GemmKernelAVX2MXFP4 {
   static constexpr int N_BLOCK = 64;
   static constexpr int K_BLOCK = 128;
   static constexpr double ELEMENT_SIZE = 0.5;
+  static constexpr bool NATIVE_UE8M0 = NativeUE8M0;
 
   static void config() {}
   static int recommended_nth(int n) { return std::max(1, div_up(n, N_BLOCK)); }
   static std::pair<int, int> split_range_n(int n, int ith, int nth) { return split_range(n, ith, nth); }
-  static std::string name() { return "AVX2_MXFP4"; }
+  static std::string name() { return NativeUE8M0 ? "AVX2_MXFP4_UE8M0" : "AVX2_FP4_FP32_SCALE"; }
 
   // FP4 E2M1 → BF16 lookup tables (low byte and high byte of BF16)
   // Identical to amx/fp4-moe.hpp GemmKernel224MXFP4SmallKGroup LUTs
@@ -118,7 +121,8 @@ struct GemmKernelAVX2MXFP4 {
 
   struct BufferB {
     uint8_t* b = nullptr;  // nibble-packed FP4 (may be nullptr in scale-only mode)
-    float* d = nullptr;    // FP32 group scales
+    uint8_t* d_ue8m0 = nullptr;  // native one-byte exponent scales
+    float* d = nullptr;           // legacy/NVFP4 effective FP32 scales
     int n = 0, k = 0, k_group_size = 0, k_group_count = 0;
 
     BufferB() = default;
@@ -129,7 +133,12 @@ struct GemmKernelAVX2MXFP4 {
       if (k_group_size <= 0 || k % k_group_size != 0 || k % 8 != 0)
         throw std::runtime_error("MXFP4 AVX2 requires k % group_size == 0 and k % 8 == 0");
       k_group_count = k / k_group_size;
-      d = (float*)((uint8_t*)ptr + (size_t)n * k / 2);
+      void* scale_ptr = (uint8_t*)ptr + (size_t)n * k / 2;
+      if constexpr (NativeUE8M0) {
+        d_ue8m0 = (uint8_t*)scale_ptr;
+      } else {
+        d = (float*)scale_ptr;
+      }
     }
 
     // Scale-only: b is set externally from mmap'd safetensor data.
@@ -138,14 +147,18 @@ struct GemmKernelAVX2MXFP4 {
       if (k_group_size <= 0 || k % k_group_size != 0 || k % 8 != 0)
         throw std::runtime_error("MXFP4 AVX2 requires k % group_size == 0 and k % 8 == 0");
       k_group_count = k / k_group_size;
-      d = (float*)scale_ptr;
+      if constexpr (NativeUE8M0) {
+        d_ue8m0 = (uint8_t*)scale_ptr;
+      } else {
+        d = (float*)scale_ptr;
+      }
     }
 
     static size_t required_size(size_t n, size_t k, int k_group_size) {
-      return n * k / 2 + n * (k / k_group_size) * sizeof(float);
+      return n * k / 2 + n * (k / k_group_size) * (NativeUE8M0 ? sizeof(uint8_t) : sizeof(float));
     }
     static size_t required_size_scale_only(size_t n, size_t k, int k_group_size) {
-      return n * (k / k_group_size) * sizeof(float);
+      return n * (k / k_group_size) * (NativeUE8M0 ? sizeof(uint8_t) : sizeof(float));
     }
 
     void from_raw_mat(const uint8_t* proj, int ith, int nth) {
@@ -153,6 +166,16 @@ struct GemmKernelAVX2MXFP4 {
       auto [n_start, n_end] = split_range(n, ith, nth);
       const size_t row_bytes = (size_t)k / 2;
       std::memcpy(b + n_start * row_bytes, proj + n_start * row_bytes, (size_t)(n_end - n_start) * row_bytes);
+    }
+
+    static inline float decode_ue8m0(uint8_t exponent) {
+      return mxfp4::ue8m0_to_fp32(exponent);
+    }
+
+    inline float scale_at(int row, int group) const {
+      const size_t index = static_cast<size_t>(row) * k_group_count + group;
+      if constexpr (NativeUE8M0) return decode_ue8m0(d_ue8m0[index]);
+      return d[index];
     }
   };
 
@@ -179,14 +202,18 @@ struct GemmKernelAVX2MXFP4 {
   };
 };
 
+using GemmKernelAVX2MXFP4 = GemmKernelAVX2MXFP4Impl<true>;
+using GemmKernelAVX2FP4FP32Scale = GemmKernelAVX2MXFP4Impl<false>;
+
 // ============================================================================
 // Compute: M tokens × N output neurons, K inner dimension, group_size scale
 //
 // N-outer loop: each weight row loaded once and shared across M tokens.
 // 4-token M-blocking for prefill: weight decode amortized over 4 activations.
 // ============================================================================
-static void gemm_mxfp4(int m, int n, int k, GemmKernelAVX2MXFP4::BufferA& a, GemmKernelAVX2MXFP4::BufferB& b,
-                       GemmKernelAVX2MXFP4::BufferC& c, int ith, int nth) {
+template <typename Kernel>
+static void gemm_mxfp4(int m, int n, int k, typename Kernel::BufferA& a, typename Kernel::BufferB& b,
+                       typename Kernel::BufferC& c, int ith, int nth) {
   // H3: Check weight buffer is not null
   if (b.b == nullptr) {
     throw std::runtime_error("gemm_mxfp4: weight buffer (b.b) is null");
@@ -196,13 +223,11 @@ static void gemm_mxfp4(int m, int n, int k, GemmKernelAVX2MXFP4::BufferA& a, Gem
   const int group_size = b.k_group_size;
   const size_t row_bytes = (size_t)k / 2;
 
-  const __m128i lut_lo = _mm_load_si128((const __m128i*)GemmKernelAVX2MXFP4::fp4_bf16_lo);
-  const __m128i lut_hi = _mm_load_si128((const __m128i*)GemmKernelAVX2MXFP4::fp4_bf16_hi);
+  const __m128i lut_lo = _mm_load_si128((const __m128i*)Kernel::fp4_bf16_lo);
+  const __m128i lut_hi = _mm_load_si128((const __m128i*)Kernel::fp4_bf16_hi);
 
   for (int ni = n_start; ni < n_end; ni++) {
     const uint8_t* b_row = b.b + (size_t)ni * row_bytes;
-    const float* b_scales = b.d + (size_t)ni * group_count;
-
     if (ni + 1 < n_end) {
       _mm_prefetch((const char*)(b.b + (size_t)(ni + 1) * row_bytes), _MM_HINT_T0);
       _mm_prefetch((const char*)(b.b + (size_t)(ni + 1) * row_bytes + 64), _MM_HINT_T0);
@@ -228,10 +253,10 @@ static void gemm_mxfp4(int m, int n, int k, GemmKernelAVX2MXFP4::BufferA& a, Gem
         int ki = 0;
         for (; ki + 32 <= group_size; ki += 32) {
           const uint8_t* w = b_row + (k_base + ki) / 2;
-          __m256 wv0 = GemmKernelAVX2MXFP4::fp4x8_to_fp32(w + 0, lut_lo, lut_hi);
-          __m256 wv1 = GemmKernelAVX2MXFP4::fp4x8_to_fp32(w + 4, lut_lo, lut_hi);
-          __m256 wv2 = GemmKernelAVX2MXFP4::fp4x8_to_fp32(w + 8, lut_lo, lut_hi);
-          __m256 wv3 = GemmKernelAVX2MXFP4::fp4x8_to_fp32(w + 12, lut_lo, lut_hi);
+          __m256 wv0 = Kernel::fp4x8_to_fp32(w + 0, lut_lo, lut_hi);
+          __m256 wv1 = Kernel::fp4x8_to_fp32(w + 4, lut_lo, lut_hi);
+          __m256 wv2 = Kernel::fp4x8_to_fp32(w + 8, lut_lo, lut_hi);
+          __m256 wv3 = Kernel::fp4x8_to_fp32(w + 12, lut_lo, lut_hi);
 
           g0 = _mm256_fmadd_ps(load_bf16_to_fp32(a0 + k_base + ki), wv0, g0);
           g0 = _mm256_fmadd_ps(load_bf16_to_fp32(a0 + k_base + ki + 8), wv1, g0);
@@ -255,14 +280,15 @@ static void gemm_mxfp4(int m, int n, int k, GemmKernelAVX2MXFP4::BufferA& a, Gem
         }
         for (; ki + 8 <= group_size; ki += 8) {
           const uint8_t* w = b_row + (k_base + ki) / 2;
-          __m256 wv = GemmKernelAVX2MXFP4::fp4x8_to_fp32(w, lut_lo, lut_hi);
+          __m256 wv = Kernel::fp4x8_to_fp32(w, lut_lo, lut_hi);
           g0 = _mm256_fmadd_ps(load_bf16_to_fp32(a0 + k_base + ki), wv, g0);
           g1 = _mm256_fmadd_ps(load_bf16_to_fp32(a1 + k_base + ki), wv, g1);
           g2 = _mm256_fmadd_ps(load_bf16_to_fp32(a2 + k_base + ki), wv, g2);
           g3 = _mm256_fmadd_ps(load_bf16_to_fp32(a3 + k_base + ki), wv, g3);
         }
 
-        __m256 sv = _mm256_broadcast_ss(&b_scales[g]);
+        const float scale = b.scale_at(ni, g);
+        __m256 sv = _mm256_set1_ps(scale);
         tot0 = _mm256_fmadd_ps(g0, sv, tot0);
         tot1 = _mm256_fmadd_ps(g1, sv, tot1);
         tot2 = _mm256_fmadd_ps(g2, sv, tot2);
@@ -281,7 +307,7 @@ static void gemm_mxfp4(int m, int n, int k, GemmKernelAVX2MXFP4::BufferA& a, Gem
       float scalar_tail = 0.0f;
 
       for (int g = 0; g < group_count; g++) {
-        const float scale = b_scales[g];
+        const float scale = b.scale_at(ni, g);
         const int k_base = g * group_size;
         __m256 acc0 = _mm256_setzero_ps(), acc1 = _mm256_setzero_ps();
         __m256 acc2 = _mm256_setzero_ps(), acc3 = _mm256_setzero_ps();
@@ -290,20 +316,20 @@ static void gemm_mxfp4(int m, int n, int k, GemmKernelAVX2MXFP4::BufferA& a, Gem
         for (; ki + 32 <= group_size; ki += 32) {
           const uint8_t* w = b_row + (k_base + ki) / 2;
           acc0 = _mm256_fmadd_ps(load_bf16_to_fp32(a_row + k_base + ki),
-                                 GemmKernelAVX2MXFP4::fp4x8_to_fp32(w + 0, lut_lo, lut_hi), acc0);
+                                 Kernel::fp4x8_to_fp32(w + 0, lut_lo, lut_hi), acc0);
           acc1 = _mm256_fmadd_ps(load_bf16_to_fp32(a_row + k_base + ki + 8),
-                                 GemmKernelAVX2MXFP4::fp4x8_to_fp32(w + 4, lut_lo, lut_hi), acc1);
+                                 Kernel::fp4x8_to_fp32(w + 4, lut_lo, lut_hi), acc1);
           acc2 = _mm256_fmadd_ps(load_bf16_to_fp32(a_row + k_base + ki + 16),
-                                 GemmKernelAVX2MXFP4::fp4x8_to_fp32(w + 8, lut_lo, lut_hi), acc2);
+                                 Kernel::fp4x8_to_fp32(w + 8, lut_lo, lut_hi), acc2);
           acc3 = _mm256_fmadd_ps(load_bf16_to_fp32(a_row + k_base + ki + 24),
-                                 GemmKernelAVX2MXFP4::fp4x8_to_fp32(w + 12, lut_lo, lut_hi), acc3);
+                                 Kernel::fp4x8_to_fp32(w + 12, lut_lo, lut_hi), acc3);
         }
         __m256 g_acc = _mm256_add_ps(_mm256_add_ps(acc0, acc2), _mm256_add_ps(acc1, acc3));
 
         for (; ki + 8 <= group_size; ki += 8) {
           const uint8_t* w = b_row + (k_base + ki) / 2;
           g_acc = _mm256_fmadd_ps(load_bf16_to_fp32(a_row + k_base + ki),
-                                  GemmKernelAVX2MXFP4::fp4x8_to_fp32(w, lut_lo, lut_hi), g_acc);
+                                  Kernel::fp4x8_to_fp32(w, lut_lo, lut_hi), g_acc);
         }
 
         total_acc = _mm256_fmadd_ps(g_acc, _mm256_broadcast_ss(&scale), total_acc);
@@ -312,7 +338,7 @@ static void gemm_mxfp4(int m, int n, int k, GemmKernelAVX2MXFP4::BufferA& a, Gem
           const int pos = k_base + ki;
           const uint8_t packed = b_row[pos / 2];
           const uint8_t nib = (pos & 1) ? (packed >> 4) : (packed & 0x0F);
-          scalar_tail += GGML_BF16_TO_FP32(a_row[pos]) * GemmKernelAVX2MXFP4::fp4_scalar(nib) * scale;
+          scalar_tail += GGML_BF16_TO_FP32(a_row[pos]) * Kernel::fp4_scalar(nib) * scale;
         }
       }
 
@@ -333,13 +359,17 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
   using Base::down_ba_;
   using Base::down_bb_;
   using Base::down_bc_;
+  using Base::down_raw_scale_bytes_;
   using Base::gate_bb_;
   using Base::gate_bc_;
+  using Base::gate_raw_scale_bytes_;
   using Base::gate_up_ba_;
+  using Base::has_raw_scale_storage;
   using Base::m_local_num_;
   using Base::tp_part_idx;
   using Base::up_bb_;
   using Base::up_bc_;
+  using Base::up_raw_scale_bytes_;
 
  public:
   using typename Base::input_t;
@@ -381,13 +411,14 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
     int m = m_local_num_[expert_idx];
     auto& bb = do_up ? up_bb_[expert_idx] : gate_bb_[expert_idx];
     auto& bc = do_up ? up_bc_[expert_idx] : gate_bc_[expert_idx];
-    avx2::gemm_mxfp4(m, config_.intermediate_size, config_.hidden_size, *gate_up_ba_[expert_idx], *bb, *bc, ith, nth);
+    avx2::gemm_mxfp4<T>(m, config_.intermediate_size, config_.hidden_size, *gate_up_ba_[expert_idx], *bb, *bc, ith,
+                         nth);
   }
 
   void do_down_gemm(int expert_idx, int ith, int nth, int) {
     int m = m_local_num_[expert_idx];
-    avx2::gemm_mxfp4(m, config_.hidden_size, config_.intermediate_size, *down_ba_[expert_idx], *down_bb_[expert_idx],
-                     *down_bc_[expert_idx], ith, nth);
+    avx2::gemm_mxfp4<T>(m, config_.hidden_size, config_.intermediate_size, *down_ba_[expert_idx],
+                         *down_bb_[expert_idx], *down_bc_[expert_idx], ith, nth);
   }
 
   void load_weights() {
@@ -448,9 +479,20 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
               return;
             size_t scale_elem_count = ((size_t)config_.hidden_size * config_.intermediate_size) / group_size;
             // tp_part_idx == 0 guaranteed here, so offset is 0
-            convert_or_copy(gate_bb_[expert_idx]->d, (const ggml_bf16_t*)config_.gate_scales[0][lid], scale_elem_count);
-            convert_or_copy(up_bb_[expert_idx]->d, (const ggml_bf16_t*)config_.up_scales[0][lid], scale_elem_count);
-            convert_or_copy(down_bb_[expert_idx]->d, (const ggml_bf16_t*)config_.down_scales[0][lid], scale_elem_count);
+            if constexpr (T::NATIVE_UE8M0) {
+              std::memcpy(gate_bb_[expert_idx]->d_ue8m0, (const uint8_t*)config_.gate_scales[0][lid],
+                          scale_elem_count);
+              std::memcpy(up_bb_[expert_idx]->d_ue8m0, (const uint8_t*)config_.up_scales[0][lid], scale_elem_count);
+              std::memcpy(down_bb_[expert_idx]->d_ue8m0, (const uint8_t*)config_.down_scales[0][lid],
+                          scale_elem_count);
+            } else {
+              convert_or_copy(gate_bb_[expert_idx]->d, (const ggml_bf16_t*)config_.gate_scales[0][lid],
+                              scale_elem_count);
+              convert_or_copy(up_bb_[expert_idx]->d, (const ggml_bf16_t*)config_.up_scales[0][lid],
+                              scale_elem_count);
+              convert_or_copy(down_bb_[expert_idx]->d, (const ggml_bf16_t*)config_.down_scales[0][lid],
+                              scale_elem_count);
+            }
           },
           nullptr);
     } else {
@@ -489,12 +531,21 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
             if (config_.should_skip_expert(expert_idx)) return;
             uint64_t lid = expert_map(physical_to_logical_map, expert_idx);
             size_t scale_elem_count = ((size_t)config_.hidden_size * config_.intermediate_size) / group_size;
-            convert_or_copy(gate_bb_[expert_idx]->d, (ggml_bf16_t*)config_.gate_scale + lid * scale_elem_count,
-                            scale_elem_count);
-            convert_or_copy(up_bb_[expert_idx]->d, (ggml_bf16_t*)config_.up_scale + lid * scale_elem_count,
-                            scale_elem_count);
-            convert_or_copy(down_bb_[expert_idx]->d, (ggml_bf16_t*)config_.down_scale + lid * scale_elem_count,
-                            scale_elem_count);
+            if constexpr (T::NATIVE_UE8M0) {
+              std::memcpy(gate_bb_[expert_idx]->d_ue8m0, (const uint8_t*)config_.gate_scale + lid * scale_elem_count,
+                          scale_elem_count);
+              std::memcpy(up_bb_[expert_idx]->d_ue8m0, (const uint8_t*)config_.up_scale + lid * scale_elem_count,
+                          scale_elem_count);
+              std::memcpy(down_bb_[expert_idx]->d_ue8m0, (const uint8_t*)config_.down_scale + lid * scale_elem_count,
+                          scale_elem_count);
+            } else {
+              convert_or_copy(gate_bb_[expert_idx]->d, (ggml_bf16_t*)config_.gate_scale + lid * scale_elem_count,
+                              scale_elem_count);
+              convert_or_copy(up_bb_[expert_idx]->d, (ggml_bf16_t*)config_.up_scale + lid * scale_elem_count,
+                              scale_elem_count);
+              convert_or_copy(down_bb_[expert_idx]->d, (ggml_bf16_t*)config_.down_scale + lid * scale_elem_count,
+                              scale_elem_count);
+            }
           },
           nullptr);
     }
@@ -521,14 +572,23 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
     size_t gpu_tp_weight_bytes = (size_t)full_config.intermediate_size * full_config.hidden_size / gpu_tp_count / 2;
     size_t gpu_tp_scale_elem_count =
         (size_t)full_config.intermediate_size * full_config.hidden_size / gpu_tp_count / group_size;
+    if (config_.quant_config.quant_method == "NVFP4" && !has_raw_scale_storage(expert_id)) {
+      throw std::runtime_error("NVFP4 raw scale storage is missing; cannot upload FP8 block scales to GPU buffers");
+    }
+    const bool write_raw_nvfp4_scales = config_.quant_config.quant_method == "NVFP4";
+    const uint8_t* gate_raw_scale = write_raw_nvfp4_scales ? gate_raw_scale_bytes_[expert_id].data() : nullptr;
+    const uint8_t* up_raw_scale = write_raw_nvfp4_scales ? up_raw_scale_bytes_[expert_id].data() : nullptr;
+    const uint8_t* down_raw_scale = write_raw_nvfp4_scales ? down_raw_scale_bytes_[expert_id].data() : nullptr;
 
     if (cpu_tp_count >= gpu_tp_count) {
       int target_gpu_tp = tp_part_idx / (cpu_tp_count / gpu_tp_count);
       int local_idx = tp_part_idx % (cpu_tp_count / gpu_tp_count);
       uint8_t* w13_wdst = (uint8_t*)w13_weight_ptrs[target_gpu_tp];
       ggml_bf16_t* w13_sdst = (ggml_bf16_t*)w13_scale_ptrs[target_gpu_tp];
+      uint8_t* w13_sdst_raw = (uint8_t*)w13_scale_ptrs[target_gpu_tp];
       uint8_t* w2_wdst = (uint8_t*)w2_weight_ptrs[target_gpu_tp];
       ggml_bf16_t* w2_sdst = (ggml_bf16_t*)w2_scale_ptrs[target_gpu_tp];
+      uint8_t* w2_sdst_raw = (uint8_t*)w2_scale_ptrs[target_gpu_tp];
       size_t w_off = (size_t)local_idx * cpu_tp_weight_bytes;
       size_t s_off = (size_t)local_idx * cpu_tp_scale_elem_count;
 
@@ -555,12 +615,32 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
               size_t gwo = (size_t)local_idx * wpc, gso = (size_t)local_idx * spc;
               for (size_t col = cs; col < ce; col++) {
                 std::memcpy(w2_wdst + col * gws + gwo, down_bb_[expert_id]->b + col * wpc, wpc);
-                fp32_to_bf16(w2_sdst + col * gss + gso, down_bb_[expert_id]->d + col * spc, spc);
+                if constexpr (T::NATIVE_UE8M0) {
+                  std::memcpy(w2_sdst_raw + col * gss + gso, down_bb_[expert_id]->d_ue8m0 + col * spc, spc);
+                } else if (write_raw_nvfp4_scales) {
+                  std::memcpy(w2_sdst_raw + col * gss + gso, down_raw_scale + col * spc, spc);
+                } else {
+                  fp32_to_bf16(w2_sdst + col * gss + gso, down_bb_[expert_id]->d + col * spc, spc);
+                }
               }
             } else if (tid == NWT * 2 + ndt) {
-              fp32_to_bf16(w13_sdst + s_off, gate_bb_[expert_id]->d, cpu_tp_scale_elem_count);
+              if constexpr (T::NATIVE_UE8M0) {
+                std::memcpy(w13_sdst_raw + s_off, gate_bb_[expert_id]->d_ue8m0, cpu_tp_scale_elem_count);
+              } else if (write_raw_nvfp4_scales) {
+                std::memcpy(w13_sdst_raw + s_off, gate_raw_scale, cpu_tp_scale_elem_count);
+              } else {
+                fp32_to_bf16(w13_sdst + s_off, gate_bb_[expert_id]->d, cpu_tp_scale_elem_count);
+              }
             } else {
-              fp32_to_bf16(w13_sdst + s_off + gpu_tp_scale_elem_count, up_bb_[expert_id]->d, cpu_tp_scale_elem_count);
+              if constexpr (T::NATIVE_UE8M0) {
+                std::memcpy(w13_sdst_raw + s_off + gpu_tp_scale_elem_count, up_bb_[expert_id]->d_ue8m0,
+                            cpu_tp_scale_elem_count);
+              } else if (write_raw_nvfp4_scales) {
+                std::memcpy(w13_sdst_raw + s_off + gpu_tp_scale_elem_count, up_raw_scale, cpu_tp_scale_elem_count);
+              } else {
+                fp32_to_bf16(w13_sdst + s_off + gpu_tp_scale_elem_count, up_bb_[expert_id]->d,
+                             cpu_tp_scale_elem_count);
+              }
             }
           },
           nullptr);
@@ -582,8 +662,10 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
             int gtp = start_gtp + lg;
             uint8_t* w13_wdst = (uint8_t*)w13_weight_ptrs[gtp];
             ggml_bf16_t* w13_sdst = (ggml_bf16_t*)w13_scale_ptrs[gtp];
+            uint8_t* w13_sdst_raw = (uint8_t*)w13_scale_ptrs[gtp];
             uint8_t* w2_wdst = (uint8_t*)w2_weight_ptrs[gtp];
             ggml_bf16_t* w2_sdst = (ggml_bf16_t*)w2_scale_ptrs[gtp];
+            uint8_t* w2_sdst_raw = (uint8_t*)w2_scale_ptrs[gtp];
             size_t cow = (size_t)lg * dw, cos = (size_t)lg * ds;
             if (tt < NWT) {
               size_t s = (size_t)tt * wchunk, e = std::min(s + wchunk, dw);
@@ -601,12 +683,30 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
                 size_t cwoff = col * config_.intermediate_size / 2 + lg * dw / config_.hidden_size;
                 size_t csoff = col * (config_.intermediate_size / group_size) + lg * ds / config_.hidden_size;
                 std::memcpy(w2_wdst + col * wgc, down_bb_[expert_id]->b + cwoff, wgc);
-                fp32_to_bf16(w2_sdst + col * sgc, down_bb_[expert_id]->d + csoff, sgc);
+                if constexpr (T::NATIVE_UE8M0) {
+                  std::memcpy(w2_sdst_raw + col * sgc, down_bb_[expert_id]->d_ue8m0 + csoff, sgc);
+                } else if (write_raw_nvfp4_scales) {
+                  std::memcpy(w2_sdst_raw + col * sgc, down_raw_scale + csoff, sgc);
+                } else {
+                  fp32_to_bf16(w2_sdst + col * sgc, down_bb_[expert_id]->d + csoff, sgc);
+                }
               }
             } else if (tt == NWT * 2 + ndt) {
-              fp32_to_bf16(w13_sdst, gate_bb_[expert_id]->d + cos, ds);
+              if constexpr (T::NATIVE_UE8M0) {
+                std::memcpy(w13_sdst_raw, gate_bb_[expert_id]->d_ue8m0 + cos, ds);
+              } else if (write_raw_nvfp4_scales) {
+                std::memcpy(w13_sdst_raw, gate_raw_scale + cos, ds);
+              } else {
+                fp32_to_bf16(w13_sdst, gate_bb_[expert_id]->d + cos, ds);
+              }
             } else {
-              fp32_to_bf16(w13_sdst + gpu_tp_scale_elem_count, up_bb_[expert_id]->d + cos, ds);
+              if constexpr (T::NATIVE_UE8M0) {
+                std::memcpy(w13_sdst_raw + gpu_tp_scale_elem_count, up_bb_[expert_id]->d_ue8m0 + cos, ds);
+              } else if (write_raw_nvfp4_scales) {
+                std::memcpy(w13_sdst_raw + gpu_tp_scale_elem_count, up_raw_scale + cos, ds);
+              } else {
+                fp32_to_bf16(w13_sdst + gpu_tp_scale_elem_count, up_bb_[expert_id]->d + cos, ds);
+              }
             }
           },
           nullptr);
@@ -617,22 +717,9 @@ class AVX2_MXFP4_MOE_TP : public AVX2_MOE_BASE<T, AVX2_MXFP4_MOE_TP<T>> {
 // TP_MOE specialization (boilerplate, identical to rawint4 pattern)
 template <typename K>
 class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_MOE_TP<K>>> {
-  std::vector<void*> tp_owned_down_bufs_;
-  std::vector<void*> tp_owned_gate_bufs_;
-  std::vector<void*> tp_owned_up_bufs_;
-
  public:
   using Base = TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_MOE_TP<K>>>;
   using Base::Base;
-
-  ~TP_MOE() {
-    for (void* p : tp_owned_down_bufs_)
-      if (p) std::free(p);
-    for (void* p : tp_owned_gate_bufs_)
-      if (p) std::free(p);
-    for (void* p : tp_owned_up_bufs_)
-      if (p) std::free(p);
-  }
 
   void load_weights() override {
     auto& config = this->config;
@@ -646,13 +733,11 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
     if (use_per_expert) {
       int group_size = config.quant_config.group_size;
       int full_interm = config.intermediate_size;
+      bool copy_nvfp4_raw_scales = config.quant_config.quant_method == "NVFP4";
 
-      // Allocate per-partition repack buffers for all projections.
-      // Previously gate/up used direct mmap pointers, causing use-after-free when Python
-      // releases mmap. Now we memcpy all weights to decouple from mmap lifecycle (aligned with AMX).
-      tp_owned_down_bufs_.resize(this->tp_count, nullptr);
-      tp_owned_gate_bufs_.resize(this->tp_count, nullptr);
-      tp_owned_up_bufs_.resize(this->tp_count, nullptr);
+      // The base class already allocated a complete owned BufferB for every
+      // expert. Copy directly into it so closing the safetensor mmap is safe
+      // without retaining a second complete expert-weight allocation.
       pool->dispense_backend()->do_numa_job([&, this](int i) {
         auto* tp = tps[i].get();
         auto& tpc = tp->config_;
@@ -663,24 +748,13 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
                                    std::to_string(per_tp_interm));
         // gate/up: [intermediate × hidden] = [N × K], TP slices along N → contiguous rows
         size_t gate_up_wt_per_expert = (size_t)per_tp_interm * tpc.hidden_size / 2;
-        size_t gate_up_alloc = ((size_t)tpc.expert_num * gate_up_wt_per_expert + 63) & ~(size_t)63;
-        uint8_t* gate_buf = (uint8_t*)std::aligned_alloc(64, gate_up_alloc);
-        uint8_t* up_buf = (uint8_t*)std::aligned_alloc(64, gate_up_alloc);
-        if (!gate_buf || !up_buf) throw std::runtime_error("aligned_alloc failed for MXFP4 gate/up_buf");
-        tp_owned_gate_bufs_[i] = gate_buf;
-        tp_owned_up_bufs_[i] = up_buf;
-        // down: [hidden × intermediate], TP slices along K → non-contiguous
-        size_t down_wt_per_expert = (size_t)tpc.hidden_size * per_tp_interm / 2;
-        size_t alloc_size = ((size_t)tpc.expert_num * down_wt_per_expert + 63) & ~(size_t)63;
-        uint8_t* down_buf = (uint8_t*)std::aligned_alloc(64, alloc_size);
-        if (!down_buf) throw std::runtime_error("aligned_alloc failed for MXFP4 down_buf");
-        tp_owned_down_bufs_[i] = down_buf;
+        size_t scale_count = (size_t)(tpc.hidden_size / group_size) * per_tp_interm;
+        if (copy_nvfp4_raw_scales) tp->init_raw_scale_storage(tpc.expert_num, scale_count);
 
         auto subpool = pool->get_subpool(i);
         subpool->do_work_stealing_job(
             tpc.expert_num, nullptr,
-            [&, i, per_tp_interm, full_interm, gate_buf, up_buf, down_buf, gate_up_wt_per_expert,
-             down_wt_per_expert](int eid) {
+            [&, i, per_tp_interm, full_interm, gate_up_wt_per_expert](int eid) {
               if (tpc.should_skip_expert(eid)) return;
               uint64_t lid = expert_map(physical_to_logical_map, eid);
 
@@ -697,12 +771,10 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
               // gate/up weights: N-split, contiguous rows → memcpy TP slice into owned buffer
               // Each TP partition handles per_tp_interm rows starting at row i*per_tp_interm
               size_t n_byte_off = (size_t)i * per_tp_interm * tpc.hidden_size / 2;
-              uint8_t* dst_gate = gate_buf + (size_t)eid * gate_up_wt_per_expert;
-              uint8_t* dst_up = up_buf + (size_t)eid * gate_up_wt_per_expert;
+              uint8_t* dst_gate = tp->gate_bb_[eid]->b;
+              uint8_t* dst_up = tp->up_bb_[eid]->b;
               std::memcpy(dst_gate, (const uint8_t*)config.gate_projs[0][lid] + n_byte_off, gate_up_wt_per_expert);
               std::memcpy(dst_up, (const uint8_t*)config.up_projs[0][lid] + n_byte_off, gate_up_wt_per_expert);
-              tp->gate_bb_[eid]->b = dst_gate;
-              tp->up_bb_[eid]->b = dst_up;
 
               // gate/up scales: contiguous → convert BF16→FP32
               size_t scale_count = (size_t)(tpc.hidden_size / group_size) * per_tp_interm;
@@ -710,20 +782,38 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
               if (config.gate_scales[0][lid] == nullptr || config.up_scales[0][lid] == nullptr) {
                 throw std::runtime_error("TP_MOE load_weights: null scale pointer for expert " + std::to_string(lid));
               }
-              convert_or_copy(tp->gate_bb_[eid]->d, (const ggml_bf16_t*)config.gate_scales[0][lid] + scale_off,
-                              scale_count);
-              convert_or_copy(tp->up_bb_[eid]->d, (const ggml_bf16_t*)config.up_scales[0][lid] + scale_off,
-                              scale_count);
+              if constexpr (K::NATIVE_UE8M0) {
+                std::memcpy(tp->gate_bb_[eid]->d_ue8m0, (const uint8_t*)config.gate_scales[0][lid] + scale_off,
+                            scale_count);
+                std::memcpy(tp->up_bb_[eid]->d_ue8m0, (const uint8_t*)config.up_scales[0][lid] + scale_off,
+                            scale_count);
+              } else {
+                convert_or_copy(tp->gate_bb_[eid]->d, (const ggml_bf16_t*)config.gate_scales[0][lid] + scale_off,
+                                scale_count);
+                convert_or_copy(tp->up_bb_[eid]->d, (const ggml_bf16_t*)config.up_scales[0][lid] + scale_off,
+                                scale_count);
+              }
+              if (copy_nvfp4_raw_scales) {
+                if (config.gate_zeros.empty() || config.up_zeros.empty() || config.down_zeros.empty() ||
+                    config.gate_zeros[0][lid] == nullptr || config.up_zeros[0][lid] == nullptr ||
+                    config.down_zeros[0][lid] == nullptr) {
+                  throw std::runtime_error("TP_MOE load_weights: missing NVFP4 raw scale pointer for expert " +
+                                           std::to_string(lid));
+                }
+                std::memcpy(tp->gate_raw_scale_bytes_[eid].data(),
+                            (const uint8_t*)config.gate_zeros[0][lid] + scale_off, scale_count);
+                std::memcpy(tp->up_raw_scale_bytes_[eid].data(),
+                            (const uint8_t*)config.up_zeros[0][lid] + scale_off, scale_count);
+              }
 
               // down weights: K-split, non-contiguous → per-row memcpy into repack buf
               uint8_t* src_down = (uint8_t*)config.down_projs[0][lid];
-              uint8_t* dst_down = down_buf + (size_t)eid * down_wt_per_expert;
+              uint8_t* dst_down = tp->down_bb_[eid]->b;
               for (int row = 0; row < tpc.hidden_size; row++) {
                 std::memcpy(dst_down + (size_t)row * per_tp_interm / 2,
                             src_down + (size_t)row * full_interm / 2 + (size_t)i * per_tp_interm / 2,
                             per_tp_interm / 2);
               }
-              tp->down_bb_[eid]->b = dst_down;
 
               // down scales: K-split, non-contiguous → per-row convert
               if (config.down_scales[0][lid] == nullptr) {
@@ -734,9 +824,26 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
               int per_tp_groups = per_tp_interm / group_size;
               const ggml_bf16_t* src_ds = (const ggml_bf16_t*)config.down_scales[0][lid];
               float* dst_ds = tp->down_bb_[eid]->d;
+              const uint8_t* src_ue8m0_ds = (const uint8_t*)config.down_scales[0][lid];
+              uint8_t* dst_ue8m0_ds = tp->down_bb_[eid]->d_ue8m0;
+              const uint8_t* src_raw_ds =
+                  copy_nvfp4_raw_scales ? (const uint8_t*)config.down_zeros[0][lid] : nullptr;
+              uint8_t* dst_raw_ds = copy_nvfp4_raw_scales ? tp->down_raw_scale_bytes_[eid].data() : nullptr;
               for (int row = 0; row < tpc.hidden_size; row++) {
-                convert_or_copy(dst_ds + (size_t)row * per_tp_groups,
-                                src_ds + (size_t)row * full_interm_groups + (size_t)i * per_tp_groups, per_tp_groups);
+                if constexpr (K::NATIVE_UE8M0) {
+                  std::memcpy(dst_ue8m0_ds + (size_t)row * per_tp_groups,
+                              src_ue8m0_ds + (size_t)row * full_interm_groups + (size_t)i * per_tp_groups,
+                              per_tp_groups);
+                } else {
+                  convert_or_copy(dst_ds + (size_t)row * per_tp_groups,
+                                  src_ds + (size_t)row * full_interm_groups + (size_t)i * per_tp_groups,
+                                  per_tp_groups);
+                }
+                if (copy_nvfp4_raw_scales) {
+                  std::memcpy(dst_raw_ds + (size_t)row * per_tp_groups,
+                              src_raw_ds + (size_t)row * full_interm_groups + (size_t)i * per_tp_groups,
+                              per_tp_groups);
+                }
               }
             },
             nullptr);
@@ -754,9 +861,15 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
         tpc.gate_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
         tpc.up_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
         tpc.down_proj = new uint8_t[(tpc.expert_num * weight_elem_count) / 2];
-        tpc.gate_scale = new ggml_bf16_t[tpc.expert_num * scales_elem_count];
-        tpc.up_scale = new ggml_bf16_t[tpc.expert_num * scales_elem_count];
-        tpc.down_scale = new ggml_bf16_t[tpc.expert_num * scales_elem_count];
+        if constexpr (K::NATIVE_UE8M0) {
+          tpc.gate_scale = new uint8_t[tpc.expert_num * scales_elem_count];
+          tpc.up_scale = new uint8_t[tpc.expert_num * scales_elem_count];
+          tpc.down_scale = new uint8_t[tpc.expert_num * scales_elem_count];
+        } else {
+          tpc.gate_scale = new ggml_bf16_t[tpc.expert_num * scales_elem_count];
+          tpc.up_scale = new ggml_bf16_t[tpc.expert_num * scales_elem_count];
+          tpc.down_scale = new ggml_bf16_t[tpc.expert_num * scales_elem_count];
+        }
       });
 
       // Fill the TP-sliced flat buffers from full-model data, then load.
@@ -775,6 +888,7 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
         pool->get_subpool(i)->do_work_stealing_job(
             tpc.expert_num, nullptr,
             [&, i](int eid) {
+              if (tpc.should_skip_expert(eid)) return;
               uint64_t lid = expert_map(physical_to_logical_map, eid);
               uint8_t* src_gate = (uint8_t*)config.gate_proj +
                                   (lid * (size_t)config.intermediate_size + i * n_per_tp) * config.hidden_size / 2;
@@ -782,26 +896,30 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
                                 (lid * (size_t)config.intermediate_size + i * n_per_tp) * config.hidden_size / 2;
               std::memcpy((uint8_t*)tpc.gate_proj + eid * weight_elem_count / 2, src_gate, weight_elem_count / 2);
               std::memcpy((uint8_t*)tpc.up_proj + eid * weight_elem_count / 2, src_up, weight_elem_count / 2);
-              ggml_bf16_t* src_gate_scale =
-                  (ggml_bf16_t*)config.gate_scale +
-                  (lid * (size_t)config.intermediate_size + i * n_per_tp) * hidden_groups_per_row;
-              ggml_bf16_t* src_up_scale =
-                  (ggml_bf16_t*)config.up_scale +
-                  (lid * (size_t)config.intermediate_size + i * n_per_tp) * hidden_groups_per_row;
-              std::memcpy((ggml_bf16_t*)tpc.gate_scale + eid * scales_elem_count, src_gate_scale,
-                          scales_elem_count * sizeof(ggml_bf16_t));
-              std::memcpy((ggml_bf16_t*)tpc.up_scale + eid * scales_elem_count, src_up_scale,
-                          scales_elem_count * sizeof(ggml_bf16_t));
+              const size_t scale_elem_bytes = K::NATIVE_UE8M0 ? sizeof(uint8_t) : sizeof(ggml_bf16_t);
+              const uint8_t* src_gate_scale =
+                  (const uint8_t*)config.gate_scale +
+                  (lid * (size_t)config.intermediate_size + i * n_per_tp) * hidden_groups_per_row * scale_elem_bytes;
+              const uint8_t* src_up_scale =
+                  (const uint8_t*)config.up_scale +
+                  (lid * (size_t)config.intermediate_size + i * n_per_tp) * hidden_groups_per_row * scale_elem_bytes;
+              std::memcpy((uint8_t*)tpc.gate_scale + eid * scales_elem_count * scale_elem_bytes, src_gate_scale,
+                          scales_elem_count * scale_elem_bytes);
+              std::memcpy((uint8_t*)tpc.up_scale + eid * scales_elem_count * scale_elem_bytes, src_up_scale,
+                          scales_elem_count * scale_elem_bytes);
               uint8_t* src_down =
                   (uint8_t*)config.down_proj + lid * (size_t)config.hidden_size * config.intermediate_size / 2;
-              ggml_bf16_t* src_down_scale =
-                  (ggml_bf16_t*)config.down_scale + lid * (size_t)config.hidden_size * full_interm_groups_per_row;
+              const uint8_t* src_down_scale =
+                  (const uint8_t*)config.down_scale +
+                  lid * (size_t)config.hidden_size * full_interm_groups_per_row * scale_elem_bytes;
               for (size_t col = 0; col < (size_t)tpc.hidden_size; col++) {
                 std::memcpy((uint8_t*)tpc.down_proj + eid * weight_elem_count / 2 + col * n_per_tp / 2,
                             src_down + (col * config.intermediate_size + i * n_per_tp) / 2, n_per_tp / 2);
-                std::memcpy((ggml_bf16_t*)tpc.down_scale + eid * scales_elem_count + col * interm_groups_per_row,
-                            src_down_scale + col * full_interm_groups_per_row + i * interm_groups_per_row,
-                            interm_groups_per_row * sizeof(ggml_bf16_t));
+                std::memcpy((uint8_t*)tpc.down_scale +
+                                (eid * scales_elem_count + col * interm_groups_per_row) * scale_elem_bytes,
+                            src_down_scale +
+                                (col * full_interm_groups_per_row + i * interm_groups_per_row) * scale_elem_bytes,
+                            interm_groups_per_row * scale_elem_bytes);
               }
             },
             nullptr);
@@ -814,9 +932,15 @@ class TP_MOE<AVX2_MXFP4_MOE_TP<K>> : public TP_MOE<AVX2_MOE_BASE<K, AVX2_MXFP4_M
         delete[] (uint8_t*)tpc.gate_proj;
         delete[] (uint8_t*)tpc.up_proj;
         delete[] (uint8_t*)tpc.down_proj;
-        delete[] (ggml_bf16_t*)tpc.gate_scale;
-        delete[] (ggml_bf16_t*)tpc.up_scale;
-        delete[] (ggml_bf16_t*)tpc.down_scale;
+        if constexpr (K::NATIVE_UE8M0) {
+          delete[] (uint8_t*)tpc.gate_scale;
+          delete[] (uint8_t*)tpc.up_scale;
+          delete[] (uint8_t*)tpc.down_scale;
+        } else {
+          delete[] (ggml_bf16_t*)tpc.gate_scale;
+          delete[] (ggml_bf16_t*)tpc.up_scale;
+          delete[] (ggml_bf16_t*)tpc.down_scale;
+        }
       });
     }
 

@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -61,6 +62,26 @@ class AMX_MOE_BASE {
   std::vector<std::shared_ptr<typename T::BufferA>> down_ba_;
   std::vector<std::shared_ptr<typename T::BufferB>> down_bb_;
   std::vector<std::shared_ptr<typename T::BufferC>> down_bc_;
+
+  std::vector<void*> owned_aligned_allocs_;
+
+  // Optional byte-exact scale payload used by FP4-family backends when their
+  // CPU compute representation differs from the GPU upload representation.
+  std::vector<std::vector<uint8_t>> gate_raw_scale_bytes_;
+  std::vector<std::vector<uint8_t>> up_raw_scale_bytes_;
+  std::vector<std::vector<uint8_t>> down_raw_scale_bytes_;
+
+  void init_raw_scale_storage(size_t expert_num, size_t scale_elem_count) {
+    gate_raw_scale_bytes_.assign(expert_num, std::vector<uint8_t>(scale_elem_count));
+    up_raw_scale_bytes_.assign(expert_num, std::vector<uint8_t>(scale_elem_count));
+    down_raw_scale_bytes_.assign(expert_num, std::vector<uint8_t>(scale_elem_count));
+  }
+
+  bool has_raw_scale_storage(int expert_id) const {
+    return expert_id >= 0 && expert_id < (int)gate_raw_scale_bytes_.size() &&
+           !gate_raw_scale_bytes_[expert_id].empty() && !up_raw_scale_bytes_[expert_id].empty() &&
+           !down_raw_scale_bytes_[expert_id].empty();
+  }
 
   size_t pool_count_ = 0;
   size_t gate_up_ba_pool_bytes_ = 0;
@@ -117,15 +138,34 @@ class AMX_MOE_BASE {
       down_ba_.push_back(make_buffer_a(config_.max_len, config_.intermediate_size, nullptr));
       down_bc_.push_back(make_buffer_c(config_.max_len, config_.hidden_size, nullptr));
 
-      void* gate_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
+      // Native FP4 experts already assigned to a GPU must not retain another
+      // complete host copy. Other AMX formats preserve their historical
+      // allocation behavior until their loaders are made sparse-aware.
+      const bool sparse_native_fp4 =
+          config_.quant_config.quant_method == "MXFP4" || config_.quant_config.quant_method == "NVFP4";
+      if (sparse_native_fp4 && config_.should_skip_expert(i)) {
+        gate_bb_.push_back(nullptr);
+        up_bb_.push_back(nullptr);
+        down_bb_.push_back(nullptr);
+        continue;
+      }
+
+      void* gate_bb_ptr = std::aligned_alloc(
+          64, (buffer_b_required_size(config_.intermediate_size, config_.hidden_size) + 63) & ~63ULL);
+      if (!gate_bb_ptr) throw std::runtime_error("aligned_alloc failed for gate BufferB");
+      owned_aligned_allocs_.push_back(gate_bb_ptr);
       gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, gate_bb_ptr));
 
-      void* up_bb_ptr = std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
+      void* up_bb_ptr = std::aligned_alloc(
+          64, (buffer_b_required_size(config_.intermediate_size, config_.hidden_size) + 63) & ~63ULL);
+      if (!up_bb_ptr) throw std::runtime_error("aligned_alloc failed for up BufferB");
+      owned_aligned_allocs_.push_back(up_bb_ptr);
       up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, up_bb_ptr));
 
-      void* down_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.hidden_size, config_.intermediate_size));
+      void* down_bb_ptr = std::aligned_alloc(
+          64, (buffer_b_required_size(config_.hidden_size, config_.intermediate_size) + 63) & ~63ULL);
+      if (!down_bb_ptr) throw std::runtime_error("aligned_alloc failed for down BufferB");
+      owned_aligned_allocs_.push_back(down_bb_ptr);
       down_bb_.push_back(make_buffer_b(config_.hidden_size, config_.intermediate_size, down_bb_ptr));
     }
     // TODO: need update to all *.hpp
@@ -147,7 +187,9 @@ class AMX_MOE_BASE {
     shared_mem_buffer_numa.alloc(tp_part_idx, this, mem_requests);
   }
 
-  ~AMX_MOE_BASE() = default;
+  ~AMX_MOE_BASE() {
+    for (void* pointer : owned_aligned_allocs_) std::free(pointer);
+  }
 
   void warm_up() {
     int qlen = config_.max_len;

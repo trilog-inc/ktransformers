@@ -1192,9 +1192,9 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
       {base}.ffn.experts.{i}.w2.{weight,scale}              down
 
     V4 ckpt keys are not prefixed with ``model.``; we also probe the stripped form so
-    callers can keep passing ``base_key="model.layers.{L}"``. ue8m0 → bf16 is a lossless
-    bit shift (both have an 8-bit exponent and zero mantissa for ue8m0), and the AMX
-    FP4 backend already consumes bf16 scales.
+    callers can keep passing ``base_key="model.layers.{L}"``. Scale tensors stay as
+    their native one-byte UE8M0 payload. The CPU kernels construct FP32 exponent
+    vectors at the point of use; no BF16 or FP32 resident scale copy is created.
     """
 
     EXPERTS_PATH_TPL = "{base}.ffn.experts"
@@ -1208,6 +1208,7 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
 
     @staticmethod
     def _ue8m0_to_bf16(scale_t: torch.Tensor) -> torch.Tensor:
+        """Reference conversion retained for parity tests, not the load path."""
         if scale_t.dtype != torch.uint8:
             scale_t = scale_t.view(torch.uint8)
         # bf16 = [sign(1) | exp(8) | mant(7)]; setting mant=0, exp=e gives 2^(e-127),
@@ -1216,6 +1217,18 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
         # Compute in int32 then narrow to int16 (max value is 255<<7=32640, fits int16),
         # because torch CPU has no lshift kernel for uint16.
         return (scale_t.to(torch.int32) << 7).to(torch.int16).view(torch.bfloat16).contiguous()
+
+    @staticmethod
+    def _as_ue8m0_bytes(scale_t: torch.Tensor) -> torch.Tensor:
+        scale_t = scale_t.contiguous()
+        if scale_t.element_size() != 1:
+            raise TypeError(
+                "MXFP4 scale tensors must use the native one-byte UE8M0 "
+                f"representation, got dtype={scale_t.dtype} element_size={scale_t.element_size()}"
+            )
+        if scale_t.dtype != torch.uint8:
+            scale_t = scale_t.view(torch.uint8)
+        return scale_t.contiguous()
 
     def load_experts(self, base_key: str, device: str = "cpu"):
         gate_name, up_name, down_name = self.PROJ_NAMES
@@ -1257,7 +1270,7 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
                 (down_name, down_scales),
             ):
                 s = self.load_tensor(f"{prefix}.{exp_id}.{proj}.scale", device)
-                dst[exp_id] = self._ue8m0_to_bf16(s)
+                dst[exp_id] = self._as_ue8m0_bytes(s)
 
         print(f"[MXFP4SafeTensorLoader] Loaded {expert_count} experts from {prefix}")
         return {
@@ -1267,6 +1280,152 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
             "gate_scale": gate_scales,
             "up_scale": up_scales,
             "down_scale": down_scales,
+        }
+
+
+class NVFP4SafeTensorLoader(SafeTensorLoader):
+    """Loader for ModelOpt/Compressed-Tensors NVFP4 expert weights.
+
+    NVFP4 uses the same packed E2M1 FP4 weight payload as MXFP4, but its
+    per-block scales are stored as FP8 E4M3 and paired with a per-tensor weight
+    scale. The CPU FP4 kernels consume BF16/FP32 dequant scales, so the loader
+    folds the per-tensor weight scale into a CPU-effective BF16 scale while also
+    returning the original FP8 blockscale bytes for SGLang GPU fallback uploads.
+    """
+
+    EXPERTS_PATH_TPLS = (
+        "{base}.mlp.experts",
+        "{base}.block_sparse_moe.experts",
+        "{base}.ffn.experts",
+        "{base}.experts",
+    )
+    PROJ_NAME_SETS = (
+        ("gate_proj", "up_proj", "down_proj"),
+        ("w1", "w3", "w2"),
+    )
+
+    def _experts_prefix_candidates(self, base_key: str) -> list[str]:
+        base_candidates = [base_key]
+        for strip in ("language_model.model.", "language_model.", "model."):
+            if base_key.startswith(strip):
+                base_candidates.append(base_key[len(strip) :])
+
+        candidates = []
+        for base in dict.fromkeys(base_candidates):
+            for tpl in self.EXPERTS_PATH_TPLS:
+                candidates.append(tpl.format(base=base))
+        return list(dict.fromkeys(candidates))
+
+    def _find_layout(self, base_key: str) -> tuple[str, tuple[str, str, str], int]:
+        for prefix in self._experts_prefix_candidates(base_key):
+            for proj_names in self.PROJ_NAME_SETS:
+                gate_name = proj_names[0]
+                expert_count = 0
+                while self.has_tensor(f"{prefix}.{expert_count}.{gate_name}.weight"):
+                    expert_count += 1
+                if expert_count > 0:
+                    return prefix, proj_names, expert_count
+        raise ValueError(
+            f"No NVFP4 experts found under any of: {self._experts_prefix_candidates(base_key)}"
+        )
+
+    @staticmethod
+    def _raw_fp8_bytes(scale_t: torch.Tensor) -> torch.Tensor:
+        scale_t = scale_t.contiguous()
+        if scale_t.dtype == torch.uint8:
+            return scale_t
+        return scale_t.view(torch.uint8).contiguous()
+
+    @staticmethod
+    def _fp8_e4m3_to_bf16(scale_t: torch.Tensor) -> torch.Tensor:
+        if scale_t.dtype == torch.uint8:
+            scale_t = scale_t.view(torch.float8_e4m3fn)
+        return scale_t.to(torch.float32)
+
+    def _load_weight_scale_2(
+        self,
+        prefix: str,
+        exp_id: int,
+        proj_name: str,
+        device: str,
+    ) -> torch.Tensor:
+        for suffix, invert in (
+            ("weight_scale_2", False),
+            ("weight_global_scale", True),
+        ):
+            key = f"{prefix}.{exp_id}.{proj_name}.{suffix}"
+            if self.has_tensor(key):
+                scale = self.load_tensor(key, device).to(torch.float32).reshape(-1)
+                scale = scale[0]
+                return (1.0 / scale) if invert else scale
+
+        print(
+            f"[NVFP4SafeTensorLoader] Missing weight_scale_2/global_scale for "
+            f"{prefix}.{exp_id}.{proj_name}; assuming already-folded block scales."
+        )
+        return torch.tensor(1.0, dtype=torch.float32, device=device)
+
+    def _load_block_scale(
+        self,
+        prefix: str,
+        exp_id: int,
+        proj_name: str,
+        device: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        for suffix in ("weight_scale", "scale"):
+            key = f"{prefix}.{exp_id}.{proj_name}.{suffix}"
+            if self.has_tensor(key):
+                raw_scale = self.load_tensor(key, device).contiguous()
+                scale_2 = self._load_weight_scale_2(prefix, exp_id, proj_name, device)
+                cpu_scale = (self._fp8_e4m3_to_bf16(raw_scale) * scale_2).to(torch.bfloat16).contiguous()
+                return cpu_scale, self._raw_fp8_bytes(raw_scale)
+        raise KeyError(f"Missing NVFP4 block scale for {prefix}.{exp_id}.{proj_name}")
+
+    def load_experts(self, base_key: str, device: str = "cpu"):
+        prefix, proj_names, expert_count = self._find_layout(base_key)
+        gate_name, up_name, down_name = proj_names
+
+        gate_weights = [None] * expert_count
+        up_weights = [None] * expert_count
+        down_weights = [None] * expert_count
+        gate_scales = [None] * expert_count
+        up_scales = [None] * expert_count
+        down_scales = [None] * expert_count
+        gate_raw_scales = [None] * expert_count
+        up_raw_scales = [None] * expert_count
+        down_raw_scales = [None] * expert_count
+
+        for exp_id in range(expert_count):
+            for proj, dst in (
+                (gate_name, gate_weights),
+                (up_name, up_weights),
+                (down_name, down_weights),
+            ):
+                w = self.load_tensor(f"{prefix}.{exp_id}.{proj}.weight", device).contiguous()
+                if w.dtype != torch.uint8:
+                    w = w.view(torch.uint8)
+                dst[exp_id] = w
+
+            for proj, scale_dst, raw_dst in (
+                (gate_name, gate_scales, gate_raw_scales),
+                (up_name, up_scales, up_raw_scales),
+                (down_name, down_scales, down_raw_scales),
+            ):
+                cpu_scale, raw_scale = self._load_block_scale(prefix, exp_id, proj, device)
+                scale_dst[exp_id] = cpu_scale
+                raw_dst[exp_id] = raw_scale
+
+        print(f"[NVFP4SafeTensorLoader] Loaded {expert_count} experts from {prefix}")
+        return {
+            "gate": gate_weights,
+            "up": up_weights,
+            "down": down_weights,
+            "gate_scale": gate_scales,
+            "up_scale": up_scales,
+            "down_scale": down_scales,
+            "gate_raw_scale": gate_raw_scales,
+            "up_raw_scale": up_raw_scales,
+            "down_raw_scale": down_raw_scales,
         }
 
 

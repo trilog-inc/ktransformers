@@ -41,6 +41,7 @@ INFERENCE_METHODS = frozenset(
         "FP8_PERCHANNEL",  # Per-channel FP8
         "GPTQ_INT4",  # GPTQ INT4
         "MXFP4",  # MXFP4 (E2M1 nibble + ue8m0 group scale, e.g. DeepSeek-V4-Flash routed experts)
+        "NVFP4",  # NVFP4 (E2M1 nibble + FP8 E4M3 block scale, e.g. ModelOpt FP4 routed experts)
         "MXFP8",  # MXFP8 (E4M3fn byte + ue8m0 group scale, e.g. MiniMax-M3-Preview)
         "LLAMAFILE",  # GGUF format
         "MOE_INT4",
@@ -335,7 +336,7 @@ def _create_inference_wrapper(
     # Select backend based on method
     if method in ["AMXINT4", "AMXINT8"]:
         backend_cls = AMXMoEWrapper
-    elif method in ["RAWINT4", "FP8", "BF16", "FP8_PERCHANNEL", "GPTQ_INT4", "MXFP4", "MXFP8"]:
+    elif method in ["RAWINT4", "FP8", "BF16", "FP8_PERCHANNEL", "GPTQ_INT4", "MXFP4", "NVFP4", "MXFP8"]:
         backend_cls = NativeMoEWrapper
     elif method == "LLAMAFILE":
         backend_cls = LlamafileMoEWrapper

@@ -14,6 +14,7 @@
 #include <immintrin.h>
 #include <cmath>
 #include "llama.cpp/ggml.h"
+#include "llama.cpp/ggml-impl.h"
 
 namespace avx2 {
 
