@@ -678,6 +678,11 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .def_readwrite("per_channel", &QuantConfig::per_channel);
 
   auto moe_module = m.def_submodule("moe");
+#if defined(__x86_64__) && defined(USE_AMX_AVX_KERNEL)
+  moe_module.attr("HAS_AMX_BF16") = py::bool_(amx::AMX_AVAILABLE);
+#else
+  moe_module.attr("HAS_AMX_BF16") = py::bool_(false);
+#endif
 
   py::class_<GeneralMOEConfig>(moe_module, "MOEConfig")
       .def(py::init([](int expert_num, int routed_expert_num, int hidden_size, int intermediate_size) {

@@ -9,11 +9,13 @@ This module provides loaders for:
 from __future__ import annotations
 
 import os
+from enum import IntEnum
+from typing import Optional, Sequence
+
 import numpy as np
 import torch
-from enum import IntEnum
-from safetensors import safe_open
 from gguf.gguf_reader import GGUFReader
+from safetensors import safe_open
 
 
 class GGMLQuantizationType(IntEnum):
@@ -1230,7 +1232,12 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
             scale_t = scale_t.view(torch.uint8)
         return scale_t.contiguous()
 
-    def load_experts(self, base_key: str, device: str = "cpu"):
+    def load_experts(
+        self,
+        base_key: str,
+        device: str = "cpu",
+        expert_ids: Optional[Sequence[int]] = None,
+    ):
         gate_name, up_name, down_name = self.PROJ_NAMES
         prefix = None
         expert_count = 0
@@ -1246,6 +1253,22 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
                 f"No MXFP4 experts found under any of: {self._experts_prefix_candidates(base_key)}"
             )
 
+        if expert_ids is None:
+            selected_expert_ids = list(range(expert_count))
+        else:
+            selected_expert_ids = sorted({int(expert_id) for expert_id in expert_ids})
+            if selected_expert_ids and (
+                selected_expert_ids[0] < 0
+                or selected_expert_ids[-1] >= expert_count
+            ):
+                raise ValueError(
+                    f"MXFP4 expert ids must be in [0, {expert_count}), "
+                    f"got range [{selected_expert_ids[0]}, {selected_expert_ids[-1]}]"
+                )
+
+        # Keep global logical indexing so C++ can use the compact
+        # physical-to-logical map directly. Unselected GPU entries stay None
+        # and are exported as null pointers.
         gate_weights = [None] * expert_count
         up_weights = [None] * expert_count
         down_weights = [None] * expert_count
@@ -1253,7 +1276,7 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
         up_scales = [None] * expert_count
         down_scales = [None] * expert_count
 
-        for exp_id in range(expert_count):
+        for exp_id in selected_expert_ids:
             for proj, dst in (
                 (gate_name, gate_weights),
                 (up_name, up_weights),
@@ -1272,7 +1295,10 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
                 s = self.load_tensor(f"{prefix}.{exp_id}.{proj}.scale", device)
                 dst[exp_id] = self._as_ue8m0_bytes(s)
 
-        print(f"[MXFP4SafeTensorLoader] Loaded {expert_count} experts from {prefix}")
+        print(
+            f"[MXFP4SafeTensorLoader] Loaded {len(selected_expert_ids)}/"
+            f"{expert_count} experts from {prefix}"
+        )
         return {
             "gate": gate_weights,
             "up": up_weights,

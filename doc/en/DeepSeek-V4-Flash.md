@@ -1,190 +1,149 @@
-# Running DeepSeek-V4-Flash with SGLang and KT-Kernel
+# DeepSeek-V4-Flash-0731 DSpark on RTX PRO 6000
 
-This tutorial demonstrates how to run **DeepSeek-V4-Flash** model inference using SGLang integrated with KT-Kernel for CPU-GPU heterogeneous inference. The hybrid path splits MXFP4 routed experts between CPU (KT-Kernel `cpuinfer`) and GPU (sglang `kt-num-gpu-experts`), enabling deployment on consumer-grade hardware.
+This recipe runs `deepseek-ai/DeepSeek-V4-Flash-0731` on one 96 GB RTX PRO
+6000 (SM120) with SGLang DSpark and KT-Kernel CPU/GPU expert offload. CPU
+experts remain in the checkpoint's native MXFP4 representation: packed E2M1
+weights with one UE8M0 scale per 32 values. There is no AMXINT4 conversion.
 
-## Table of Contents
+## Execution split
 
-- [Running DeepSeek-V4-Flash with SGLang and KT-Kernel](#running-deepseek-v4-flash-with-sglang-and-kt-kernel)
-  - [Table of Contents](#table-of-contents)
-  - [Hardware Requirements](#hardware-requirements)
-  - [Prerequisites](#prerequisites)
-  - [Step 1: Download Model Weights](#step-1-download-model-weights)
-  - [Step 2: Quantize CPU Weights (Optional, for AMXINT4 mode)](#step-2-quantize-cpu-weights-optional-for-amxint4-mode)
-  - [Step 3: Launch SGLang Server](#step-3-launch-sglang-server)
-    - [Launch Command (Single RTX 5090 Example)](#launch-command-single-rtx-5090-example)
-    - [Optional: Enable MTP (Multi-Token Prediction) Speculative Decoding](#optional-enable-mtp-multi-token-prediction-speculative-decoding)
-  - [Step 4: Send Inference Requests](#step-4-send-inference-requests)
-    - [Decode](#decode)
-    - [Interactive Chat (kt chat)](#interactive-chat-kt-chat)
+- The target's hot routed experts use SGLang's `flashinfer_mxfp4` SM120 path.
+- The target's remaining routed experts use KT-Kernel. Multi-token expert
+  batches use AMX-BF16 tiles; small batches use the AVX512-BF16 tail kernel.
+- KT assigns the CPU complement compact IDs and loads only those logical
+  experts, so GPU-resident routed weights are not duplicated in KT buffers.
+- The bundled DSpark/MTP layer stays entirely on the GPU. It is loaded from the
+  same 0731 checkpoint and is not duplicated in CPU memory.
+- KT runs as an eager node inside SGLang's breakable decode CUDA graph. The GPU
+  graph segments around every target MoE layer remain captured.
 
-## Hardware Requirements
+The AMX implementation expands one 32-value MXFP4 tile into a small BF16 VNNI
+scratch tile immediately before the dot product. It never creates a BF16 copy
+of the model, never treats E2M1 nibbles as integer weights, and applies the
+original per-output-channel scale in FP32 after each K=32 partial.
 
-**Validated Configuration (this tutorial):**
-- **GPU**: 1× NVIDIA RTX 5090 (32GB VRAM, SM_120)
-- **CPU**: x86 CPU with AVX512 support
-- **RAM**: ≥256GB system memory
-- **Storage**: ~340GB for model weights
+## Requirements
 
-**architectures** (auto-detected at startup; non-validated configurations should work but have not been benchmarked end-to-end):
+- Linux x86-64 CPU exposing `amx_tile`, `amx_bf16`, AVX512F/BW/VL, and
+  AVX512-BF16.
+- One RTX PRO 6000 Blackwell GPU with compute capability 12.0 and 96 GB VRAM.
+- CUDA Toolkit 13.3 and an NVIDIA driver compatible with that toolkit.
+- Enough system RAM for the native checkpoint and KT's CPU expert buffers.
+  256 GB is a lower bound; 384 GB or more leaves substantially better file
+  cache and NUMA headroom.
+- Current SGLang main containing DSpark support and FlashInfer with SM120
+  MXFP4 support.
 
-| Arch | Compute Cap | MXFP4 MoE | NSA sparse MLA | Validated |
-|------|------------|-----------|----------------|-----------|
-| Hopper (H100 / H200) | SM_90 | triton_kernels | flash_mla wheel | — |
-| Datacenter Blackwell (B100 / B200) | SM_100 | trtllm-fp4 | Triton fallback | — |
-| Consumer Blackwell (RTX 5090) | SM_120 | triton_kernels | Triton fallback | ✓ |
-| Ada Lovelace (RTX 4090 / L20 / L40) | SM_89 | triton_kernels | Triton fallback | ✓ |
-| Ampere (A100 / A6000) | SM_80 / SM_86 | triton_kernels | Triton fallback | Now supported |
-
-
-## Prerequisites
-
-1. **KT-Kernel installed**:
-   ```bash
-   git clone https://github.com/kvcache-ai/ktransformers.git
-   cd ktransformers
-   git submodule update --init --recursive
-   cd kt-kernel && ./install.sh
-   ```
-
-2. **SGLang installed** (kvcache-ai fork):
-   ```bash
-   ./install.sh   # from ktransformers root
-   ```
-
-3. **CUDA 12.8+** and **flashinfer ≥ 0.6.9** (`flashinfer-python` and `flashinfer-cubin` must be the same version):
-   ```bash
-   pip install --upgrade flashinfer-python flashinfer-cubin
-   ```
-   This upgrade is required (even though `sglang-kt` pins `flashinfer_python==0.6.3`) because V4-Flash's MXFP4 MoE module imports `mxfp8_quantize`, `trtllm_fp4_block_scale_routed_moe`, etc., which only exist in flashinfer ≥ 0.6.9.
-
-4. **transformers==4.57.1** (V4-Flash is incompatible with the 5.x series):
-   ```bash
-   pip install "transformers==4.57.1"
-   ```
-   `transformers` 5.x adds default-valued fields to `PretrainedConfig` that make `DeepSeekV4Config`'s dataclass declaration raise `TypeError: non-default argument 'quantization_config' follows default argument` at import time. `sglang-kt`'s pyproject does not pin `transformers`, so a fresh `pip install` will pull the latest 5.x and break server startup; pinning explicitly to `4.57.1` is required until the upstream fix lands.
-
-5. **tilelang** (manual install — required for the NSA sparse-MLA tilelang indexer path used on non-Hopper GPUs):
-   ```bash
-   pip install tilelang "apache-tvm-ffi<0.1.12"
-   ```
-   `sglang-kt`'s pyproject does not declare `tilelang` as a dependency, so `pip install ./python[all]` will not pull it in. Validated with `tilelang==0.1.8`.
-
-   > **Note:** Constrain `apache-tvm-ffi<0.1.12`. The standalone `apache-tvm-ffi` 0.1.12 wheel collides with the TVM FFI runtime bundled inside `tilelang`, so importing `tilelang` aborts with `TypeAttr __ffi_repr__ is already registered for type index 130` and the SGLang scheduler dies on startup. `apache-tvm-ffi==0.1.11` does not register the conflicting attribute and starts cleanly; pin until the upstream duplicate-registration fix lands.
-
-
-## Step 1: Download Model Weights
+Verify the host before building:
 
 ```bash
-mkdir -p /path/to/models
-huggingface-cli download deepseek-ai/DeepSeek-V4-Flash \
-  --local-dir /path/to/models/DeepSeek-V4-Flash
+/usr/local/cuda-13.3/bin/nvcc --version
+nvidia-smi --query-gpu=name,compute_cap,memory.total --format=csv
+grep -m1 '^flags' /proc/cpuinfo | tr ' ' '\n' | grep -E 'amx_tile|amx_bf16|avx512_bf16'
 ```
 
-## Step 2: Quantize CPU Weights (Optional, for AMXINT4 mode)
-
-This step is only needed if you want to run the CPU experts in **AMXINT4** mode instead (e.g., on Intel Xeon with AMX where INT4 is preferred over MXFP4).
-
-### Conversion Command
-
-For a 4-NUMA system with 64 physical cores assigned to CPU inference:
+## Build KT-Kernel
 
 ```bash
-cd /path/to/ktransformers/kt-kernel
+git submodule update --init --recursive
+cd kt-kernel
 
-python scripts/convert_cpu_weights_ds4.py \
-  --input-path /path/to/models/DeepSeek-V4-Flash \
-  --input-type fp4 \
-  --output /path/to/models/DeepSeek-V4-Flash-AMXINT4 \
-  --quant-method int4 \
-  --cpuinfer-threads 64 \
-  --threadpool-count 4 \
-  --no-merge-safetensor
+export CUDA_HOME=/usr/local/cuda-13.3
+export CPUINFER_CPU_INSTRUCT=NATIVE
+export CPUINFER_ENABLE_AMX=ON
+export CPUINFER_ENABLE_AVX512=ON
+export CPUINFER_ENABLE_AVX512_BF16=ON
+export CPUINFER_USE_CUDA=1
+export CPUINFER_CUDA_ARCHS=120
+
+python3 -m pip install --no-build-isolation -v .
 ```
 
-The script auto-detects `model_type=deepseek_v4` and `expert_dtype=fp4` from `config.json`, dequantizes the MXFP4 routed experts (group size 32) on GPU, and re-quantizes them to AMX-INT4 layout on CPU. Both HF (`model.layers.{L}.mlp.experts.{E}.{proj}.weight`) and V4 inference (`layers.{L}.ffn.experts.{E}.{w1,w2,w3}.weight`) key formats are supported.
+`-mamx-int8` may still appear in the extension's aggregate compiler flags
+because other pre-existing KT operators use it. The MXFP4 kernel described here
+uses `_tile_dpbf16ps`; it contains no AMX-INT4 or integer dot-product path.
 
-To use the converted weights, replace the relevant flags in Step 3's launch command:
+The compiled module exposes `kt_kernel_ext.moe.HAS_AMX_BF16`. With
+`KT_MXFP4_BACKEND=amx`, startup fails instead of silently falling back if either
+the binary or host lacks AMX-BF16.
+
+## Download the checkpoint
 
 ```bash
-  --kt-weight-path /path/to/models/DeepSeek-V4-Flash-AMXINT4 \
-  --kt-method AMXINT4 \
+huggingface-cli download deepseek-ai/DeepSeek-V4-Flash-0731 \
+  --local-dir /models/DeepSeek-V4-Flash-0731
 ```
 
-## Step 3: Launch SGLang Server
+Point both `--model-path` and `--kt-weight-path` at that directory. No weight
+conversion step is required. KT reads keys such as
+`layers.0.ffn.experts.0.w1.weight` and `.scale` directly from the 48-shard
+checkpoint.
 
-### Launch Command (Single RTX 5090 Example)
+## Launch
 
 ```bash
+export CUDA_HOME=/usr/local/cuda-13.3
 export FLASHINFER_CUDA_ARCH_LIST=12.0a
 export TORCH_CUDA_ARCH_LIST="12.0+PTX"
-export SGLANG_DSV4_MODE=2604
-export SGLANG_DSV4_2604_SUBMODE=2604B
 
-numactl --interleave=all python -m sglang.launch_server \
-  --host 0.0.0.0 --port 30000 \
-  --model /path/to/models/DeepSeek-V4-Flash \
-  --kt-weight-path /path/to/models/DeepSeek-V4-Flash \
-  --kt-method MXFP4 \
-  --kt-num-gpu-experts 10 \
-  --kt-cpuinfer 60 \
-  --kt-threadpool-count 2 \
-  --kt-gpu-prefill-token-threshold 4096 \
-  --kt-enable-dynamic-expert-update \
-  --tensor-parallel-size 1 \
-  --context-length 16384 \
-  --attention-backend flashinfer \
-  --mem-fraction-static 0.85 \
-  --chunked-prefill-size 2048 \
-  --max-prefill-tokens 2048 \
-  --max-running-requests 2 \
-  --watchdog-timeout 1200 \
-  --disable-shared-experts-fusion \
+python3 -m sglang.launch_server \
   --trust-remote-code \
-  --cuda-graph-bs 1 \
-  --cuda-graph-max-bs 1 \
-  --disable-radix-cache \
-  --skip-server-warmup
+  --model-path /models/DeepSeek-V4-Flash-0731 \
+  --tp 1 \
+  --moe-runner-backend flashinfer_mxfp4 \
+  --speculative-algorithm DSPARK \
+  --kt-weight-path /models/DeepSeek-V4-Flash-0731 \
+  --kt-method MXFP4 \
+  --kt-mxfp4-backend amx \
+  --kt-mxfp4-amx-min-tokens-per-expert 4 \
+  --kt-num-gpu-experts 96 \
+  --kt-expert-placement-strategy uniform \
+  --kt-cpuinfer 96 \
+  --kt-threadpool-count 2 \
+  --kt-numa-nodes 0 1 \
+  --disable-shared-experts-fusion \
+  --mem-fraction-static 0.86 \
+  --chunked-prefill-size 4096 \
+  --swa-full-tokens-ratio 0.1 \
+  --host 0.0.0.0 \
+  --port 30000
 ```
 
-Decode throughput: **20+ tok/s** on a single RTX 5090.
+Do not pass `--speculative-draft-model-path`: the 0731 checkpoint declares one
+DSpark layer, block size 5, and target capture layers 40–42. SGLang reads those
+values from `config.json`. SGLang automatically selects a breakable decode
+graph for the KT target while retaining the full-graph fast path for the
+GPU-only draft. Passing an explicit breakable backend remains supported but
+also applies that choice to the draft.
 
-It takes about 4-5 minutes to start the server (weight load + CUDA Graph capture).
+The SGLang tree also provides
+`scripts/launch_dsv4_flash_0731_dspark_kt_sm120.sh` with `check`, `build-kt`,
+and `serve` actions.
 
-See [KT-Kernel Parameters](https://github.com/kvcache-ai/ktransformers/tree/main/kt-kernel#kt-kernel-parameters) for detailed parameter tuning guidelines.
+## Performance tuning
 
-### Optional: Enable MTP (Multi-Token Prediction) Speculative Decoding
+1. Start with 96 GPU experts per layer. Reduce it in steps of 8 if model load,
+   FlashInfer post-processing, KV allocation, or graph capture exceeds 96 GB.
+   Increase it if VRAM remains and the CPU phase is the layer critical path.
+2. Profile `--kt-mxfp4-amx-min-tokens-per-expert` at 0, 2, 4, 8, and 16.
+   Decode at batch one often routes only one token to an expert, where AVX512
+   avoids AMX padding. DSpark verification and concurrent requests create the
+   larger expert batches where AMX wins.
+3. Collect routed-expert counts under representative traffic and use
+   `--kt-expert-placement-strategy frequency --init-expert-location counts.pt`.
+   This normally beats a uniform mask once the workload is stable.
+4. Use one KT thread pool per populated CPU NUMA node and list the node IDs
+   explicitly. Keep the GPU and its PCIe root complex close to the pool that
+   handles staging when the platform topology permits it.
+5. Compare DSpark block sizes under the real concurrency distribution. The
+   checkpoint default proposes five tokens. More verification work increases
+   both GPU and CPU expert batch sizes, so acceptance length and end-to-end TPOT
+   matter more than AMX utilization by itself.
+6. Tune `--mem-fraction-static` and `--chunked-prefill-size` together. Leave
+   several GiB outside SGLang for FlashInfer JIT/autotuning and graph capture.
 
-V4-Flash ships a NextN draft head that can be run as EAGLE-style speculative decoding for ~1.2× throughput on single-request decode (validated 26.5 → 32.74 tok/s on 8× RTX 5090, 90% accept rate at chain depth 1).
-
-Append the following flags to the launch command above:
-
-```bash
-  --speculative-algorithm EAGLE \
-  --speculative-num-steps 3 \
-  --speculative-eagle-topk 1 \
-  --speculative-num-draft-tokens 4 \
-  --speculative-moe-runner-backend auto \
-```
-
-## Step 4: Send Inference Requests
-
-### Decode
-
-```bash
-curl -s -X POST http://127.0.0.1:30000/generate \
-  -H "Content-Type: application/json" \
-  -d '{
-    "text": "Explain quantum computing in detail:",
-    "sampling_params": {"temperature": 0.0, "max_new_tokens": 256}
-  }'
-```
-
-### Interactive Chat (kt chat)
-
-The `kt` CLI ships with an OpenAI-compatible chat client that talks to the SGLang server's `/v1/chat/completions` endpoint:
-
-```bash
-kt chat --host 127.0.0.1 --port 30000 --temperature 0.7 --max-tokens 2048
-```
-
-
+For correctness, first compare target-only and DSpark output distributions with
+the same greedy prompts. Then benchmark warmed servers with identical request
+sets, cache state, prompt lengths, output lengths, and concurrency. Track TTFT,
+TPOT, accepted tokens per DSpark step, GPU memory, CPU memory bandwidth, AMX
+utilization, and the overlap between CPU and GPU MoE phases.
