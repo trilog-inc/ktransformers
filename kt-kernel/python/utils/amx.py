@@ -608,8 +608,14 @@ class NativeMoEWrapper(BaseMoEWrapper):
         numa_nodes: Optional[List[int]] = None,
         swiglu_limit: float = 0.0,
         swiglu_alpha: float = 0.0,
+        weight_base_key: Optional[str] = None,
+        release_loader_after_load: bool = True,
     ):
         self._swiglu_alpha = float(swiglu_alpha)
+        self.weight_base_key = (
+            str(weight_base_key) if weight_base_key is not None else None
+        )
+        self.release_loader_after_load = bool(release_loader_after_load)
         # Defence in depth: reject swiglu_limit on non-MXFP4/MXFP8 methods even
         # if the experts.py guard is bypassed (e.g., by a future caller
         # that constructs NativeMoEWrapper directly). Origin: kt-sglang 耦合.
@@ -776,11 +782,15 @@ class NativeMoEWrapper(BaseMoEWrapper):
             self.loader = NativeMoEWrapper._native_loader_instance
 
         t0 = time.time()
-        _candidates = [
-            f"model.layers.{self.layer_idx}",
-            f"language_model.model.layers.{self.layer_idx}",
-            f"model.language_model.layers.{self.layer_idx}",
-        ]
+        _candidates = (
+            [self.weight_base_key]
+            if self.weight_base_key is not None
+            else [
+                f"model.layers.{self.layer_idx}",
+                f"language_model.model.layers.{self.layer_idx}",
+                f"model.language_model.layers.{self.layer_idx}",
+            ]
+        )
         weights = None
         for base_key in _candidates:
             try:
@@ -1053,7 +1063,8 @@ class NativeMoEWrapper(BaseMoEWrapper):
             del self.up_raw_scales
             del self.down_raw_scales
 
-        NativeMoEWrapper._release_loader(layer_idx=self.layer_idx)
+        if self.release_loader_after_load:
+            NativeMoEWrapper._release_loader(layer_idx=self.layer_idx)
         t6 = time.time()
 
         print(

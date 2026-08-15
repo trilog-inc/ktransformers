@@ -154,6 +154,11 @@ class KTMoEWrapper:
         # MiniMax M3 swigluoai sigmoid alpha. 0.0 = standard silu (default).
         # Non-zero triggers gate * sigmoid(gate * alpha) * (up + 1) in act_fn.
         swiglu_alpha: float = 0.0,
+        # Optional exact checkpoint layer prefix (for example ``mtp.0``).
+        # Kept last to preserve positional compatibility with older callers.
+        weight_base_key: Optional[str] = None,
+        # Reuse the native safetensor reader across bounded incremental loads.
+        release_loader_after_load: bool = True,
     ):
         """
         Factory method to create the appropriate backend implementation.
@@ -183,6 +188,11 @@ class KTMoEWrapper:
             max_cache_depth: Maximum forward cache depth (SFT only)
             group_size: Quantization group size (SFT K-Group methods only)
             zero_point: Use zero point quantization (SFT K-Group methods only)
+            weight_base_key: Exact native-checkpoint layer prefix when auto-detection
+                is inappropriate, such as ``mtp.0`` for a bundled draft stage.
+            release_loader_after_load: Close the shared native safetensor reader
+                after this load. Disable only across bounded incremental loads and
+                call ``force_release_loader`` when the sequence completes.
 
         Returns:
             BaseMoEWrapper for inference mode, BaseSFTMoEWrapper for SFT mode
@@ -220,6 +230,8 @@ class KTMoEWrapper:
                 threadpool_count=threadpool_count,
                 weight_path=weight_path,
                 chunked_prefill_size=chunked_prefill_size,
+                weight_base_key=weight_base_key,
+                release_loader_after_load=release_loader_after_load,
                 cpu_save=cpu_save,
                 max_deferred_experts_per_token=max_deferred_experts_per_token,
                 method=method,
@@ -323,6 +335,8 @@ def _create_inference_wrapper(
     numa_nodes: Optional[List[int]] = None,
     swiglu_limit: float = 0.0,
     swiglu_alpha: float = 0.0,
+    weight_base_key: Optional[str] = None,
+    release_loader_after_load: bool = True,
 ) -> BaseMoEWrapper:
     """
     Create an inference wrapper based on the method.
@@ -354,6 +368,20 @@ def _create_inference_wrapper(
     # into a non-MXFP4 backend; act_fn would then clamp gate/up to ±10 with
     # no warning. Gate strictly on method instead. Origin: kt-sglang 耦合.
     extra_kwargs = {}
+    if weight_base_key is not None:
+        if backend_cls is not NativeMoEWrapper:
+            raise ValueError(
+                "weight_base_key is supported only by native SafeTensor backends, "
+                f"got method={method!r}."
+            )
+        extra_kwargs["weight_base_key"] = weight_base_key
+    if not release_loader_after_load:
+        if backend_cls is not NativeMoEWrapper:
+            raise ValueError(
+                "release_loader_after_load=False is supported only by native "
+                f"SafeTensor backends, got method={method!r}."
+            )
+        extra_kwargs["release_loader_after_load"] = False
     if method in ("MXFP4", "MXFP8"):
         extra_kwargs["swiglu_limit"] = swiglu_limit
         extra_kwargs["swiglu_alpha"] = swiglu_alpha
