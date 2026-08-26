@@ -32,6 +32,22 @@ class _Recorder:
         self.kwargs = kwargs
 
 
+class _NativeRecorder(_Recorder):
+    pass
+
+
+class _AMXRecorder(_Recorder):
+    pass
+
+
+class _LlamafileRecorder(_Recorder):
+    pass
+
+
+class _GeneralRecorder(_Recorder):
+    pass
+
+
 def _compile_factory():
     tree = ast.parse(EXPERTS_PATH.read_text(encoding="utf-8"))
     function = next(
@@ -54,10 +70,10 @@ def _compile_factory():
         )
     )
     namespace = {
-        "AMXMoEWrapper": _Recorder,
-        "NativeMoEWrapper": _Recorder,
-        "LlamafileMoEWrapper": _Recorder,
-        "GeneralMoEWrapper": _Recorder,
+        "AMXMoEWrapper": _AMXRecorder,
+        "NativeMoEWrapper": _NativeRecorder,
+        "LlamafileMoEWrapper": _LlamafileRecorder,
+        "GeneralMoEWrapper": _GeneralRecorder,
     }
     exec(compile(module, str(EXPERTS_PATH), "exec"), namespace)
     return namespace["_create_inference_wrapper"]
@@ -146,6 +162,30 @@ class TestSwigluLimitMethodGuards(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "only supported"):
                     factory(**_factory_kwargs(method, 10.0))
 
+    def test_factory_forwards_bounded_native_loader_options(self):
+        kwargs = _factory_kwargs("FP8", 10.0)
+        kwargs.update(
+            weight_base_key="model.layers.45",
+            release_loader_after_load=False,
+        )
+
+        wrapper = _compile_factory()(**kwargs)
+
+        self.assertEqual(wrapper.kwargs["weight_base_key"], "model.layers.45")
+        self.assertFalse(wrapper.kwargs["release_loader_after_load"])
+
+    def test_factory_rejects_bounded_loader_options_for_non_native_backend(self):
+        factory = _compile_factory()
+        for option in (
+            {"weight_base_key": "model.layers.45"},
+            {"release_loader_after_load": False},
+        ):
+            with self.subTest(option=option):
+                kwargs = _factory_kwargs("AMXINT4", 0.0)
+                kwargs.update(option)
+                with self.assertRaisesRegex(ValueError, "native SafeTensor"):
+                    factory(**kwargs)
+
     def test_both_native_wrapper_guards_have_the_same_exact_allow_list(self):
         init_guard = _native_guard("__init__")
         load_guard = _native_guard("load_weights")
@@ -163,6 +203,24 @@ class TestSwigluLimitMethodGuards(unittest.TestCase):
             with self.subTest(guard="load", method=method):
                 with self.assertRaisesRegex(ValueError, "only valid"):
                     load_guard(SimpleNamespace(swiglu_limit=10.0, method=method))
+
+    def test_native_loader_uses_exact_prefix_and_bounded_release_switch(self):
+        tree = ast.parse(AMX_PATH.read_text(encoding="utf-8"))
+        cls = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "NativeMoEWrapper"
+        )
+        load_weights = next(
+            node
+            for node in cls.body
+            if isinstance(node, ast.FunctionDef) and node.name == "load_weights"
+        )
+        source = ast.unparse(load_weights)
+
+        self.assertIn("[self.weight_base_key]", source)
+        self.assertIn("if self.release_loader_after_load", source)
+        self.assertIn("_release_loader(layer_idx=self.layer_idx)", source)
 
 
 if __name__ == "__main__":
