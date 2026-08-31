@@ -1013,6 +1013,7 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 f"only valid for FP8/MXFP4/NVFP4/MXFP8."
             )
         moe_config.swiglu_limit = self.swiglu_limit
+        moe_config.swiglu_alpha = self._swiglu_alpha
 
         # Use gate_projs instead of gate_proj for per-expert pointers
         moe_config.gate_projs = gate_ptrs
@@ -1083,7 +1084,6 @@ class NativeMoEWrapper(BaseMoEWrapper):
             moe_config.quant_config.bits = 8
             moe_config.quant_config.group_size = group_size
             moe_config.quant_config.zero_point = False
-            moe_config.swiglu_alpha = getattr(self, "_swiglu_alpha", 0.0)
             backend_cls = _select_mxfp8_backend()
             if backend_cls is None:
                 raise RuntimeError(

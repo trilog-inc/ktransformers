@@ -121,7 +121,7 @@ def _make_weights():
     return gate, up, down
 
 
-def _build_moe(backend, cpu_infer, projections):
+def _build_moe(backend, cpu_infer, projections, swiglu_alpha, swiglu_limit):
     gate, up, down = projections
     config = kt_kernel_ext.moe.MOEConfig(
         EXPERT_NUM, TOP_K, HIDDEN_SIZE, INTERMEDIATE_SIZE, 0
@@ -132,6 +132,8 @@ def _build_moe(backend, cpu_infer, projections):
     config.quant_config.bits = 4
     config.quant_config.group_size = GROUP_SIZE
     config.quant_config.zero_point = False
+    config.swiglu_alpha = swiglu_alpha
+    config.swiglu_limit = swiglu_limit
 
     for name, projection in zip(("gate", "up", "down"), projections):
         packed, block_scale, scale_2, _ = projection
@@ -146,7 +148,14 @@ def _build_moe(backend, cpu_infer, projections):
     return moe
 
 
-def _reference_moe(inputs, expert_ids, routing_weights, projections):
+def _reference_moe(
+    inputs,
+    expert_ids,
+    routing_weights,
+    projections,
+    swiglu_alpha,
+    swiglu_limit,
+):
     gate, up, down = (projection[3] for projection in projections)
     output = torch.zeros(inputs.shape[0], HIDDEN_SIZE, dtype=torch.float32)
     for token in range(inputs.shape[0]):
@@ -155,9 +164,20 @@ def _reference_moe(inputs, expert_ids, routing_weights, projections):
             expert = int(expert_ids[token, slot])
             gate_out = torch.mm(token_input, gate[expert].t()).to(torch.bfloat16)
             up_out = torch.mm(token_input, up[expert].t()).to(torch.bfloat16)
-            activated = (
-                torch.nn.functional.silu(gate_out.float()) * up_out.float()
-            ).to(torch.bfloat16)
+            gate_fp32 = gate_out.float()
+            up_fp32 = up_out.float()
+            if swiglu_alpha > 0.0:
+                if swiglu_limit > 0.0:
+                    gate_fp32 = gate_fp32.clamp(-swiglu_limit, swiglu_limit)
+                    up_fp32 = up_fp32.clamp(-swiglu_limit, swiglu_limit)
+                activated = gate_fp32 * torch.sigmoid(gate_fp32 * swiglu_alpha)
+                activated = activated * (up_fp32 + 1.0)
+            else:
+                if swiglu_limit > 0.0:
+                    gate_fp32 = gate_fp32.clamp(max=swiglu_limit)
+                    up_fp32 = up_fp32.clamp(-swiglu_limit, swiglu_limit)
+                activated = torch.nn.functional.silu(gate_fp32) * up_fp32
+            activated = activated.to(torch.bfloat16)
             expert_out = torch.mm(activated.float(), down[expert].t())
             output[token] += expert_out[0] * routing_weights[token, slot]
     return output.to(torch.bfloat16)
@@ -165,11 +185,16 @@ def _reference_moe(inputs, expert_ids, routing_weights, projections):
 
 @pytest.mark.cpu
 @pytest.mark.parametrize("qlen", [1, 8])
+@pytest.mark.parametrize("swiglu_alpha,swiglu_limit", [(0.0, 0.0), (1.702, 7.0)])
 @pytest.mark.parametrize("backend_name,backend", _available_backends())
-def test_native_nvfp4_matches_dequantized_reference(backend_name, backend, qlen):
+def test_native_nvfp4_matches_dequantized_reference(
+    backend_name, backend, swiglu_alpha, swiglu_limit, qlen
+):
     projections = _make_weights()
     cpu_infer = _make_cpu_infer()
-    moe = _build_moe(backend, cpu_infer, projections)
+    moe = _build_moe(
+        backend, cpu_infer, projections, swiglu_alpha, swiglu_limit
+    )
 
     generator = torch.Generator().manual_seed(100 + qlen)
     inputs = (torch.randn((qlen, HIDDEN_SIZE), generator=generator) * 0.05).to(
@@ -197,7 +222,14 @@ def test_native_nvfp4_matches_dequantized_reference(backend_name, backend, qlen)
     )
     cpu_infer.sync()
 
-    expected = _reference_moe(inputs, expert_ids, routing_weights, projections)
+    expected = _reference_moe(
+        inputs,
+        expert_ids,
+        routing_weights,
+        projections,
+        swiglu_alpha,
+        swiglu_limit,
+    )
     relative_error = torch.mean(torch.abs(output.float() - expected.float())) / (
         torch.mean(torch.abs(expected.float())) + 1e-8
     )

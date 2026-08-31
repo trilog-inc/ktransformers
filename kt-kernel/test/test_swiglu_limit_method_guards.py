@@ -17,7 +17,7 @@ from types import SimpleNamespace
 KT_KERNEL_ROOT = Path(__file__).resolve().parents[1]
 EXPERTS_PATH = KT_KERNEL_ROOT / "python/experts.py"
 AMX_PATH = KT_KERNEL_ROOT / "python/utils/amx.py"
-ALLOWED_METHODS = ("FP8", "MXFP4", "MXFP8")
+ALLOWED_METHODS = ("FP8", "MXFP4", "NVFP4", "MXFP8")
 REJECTED_METHODS = (
     "RAWINT4",
     "BF16",
@@ -221,6 +221,23 @@ class TestSwigluLimitMethodGuards(unittest.TestCase):
         self.assertIn("[self.weight_base_key]", source)
         self.assertIn("if self.release_loader_after_load", source)
         self.assertIn("_release_loader(layer_idx=self.layer_idx)", source)
+
+    def test_native_loader_forwards_activation_parameters_to_cpp(self):
+        tree = ast.parse(AMX_PATH.read_text(encoding="utf-8"))
+        cls = next(
+            node
+            for node in tree.body
+            if isinstance(node, ast.ClassDef) and node.name == "NativeMoEWrapper"
+        )
+        load_weights = next(
+            node
+            for node in cls.body
+            if isinstance(node, ast.FunctionDef) and node.name == "load_weights"
+        )
+        source = ast.unparse(load_weights)
+
+        self.assertIn("moe_config.swiglu_limit = self.swiglu_limit", source)
+        self.assertIn("moe_config.swiglu_alpha = self._swiglu_alpha", source)
 
 
 if __name__ == "__main__":
