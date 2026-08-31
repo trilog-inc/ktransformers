@@ -166,6 +166,24 @@ curl -s http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
+Before evaluating generation quality, compare a real checkpoint expert with
+the independent PyTorch dequantization. This tests both compiled CPU backends
+at the model's actual matrix dimensions:
+
+```bash
+cd "$KTRANSFORMERS_DIR"
+python kt-kernel/examples/validate_nvfp4_checkpoint_expert.py \
+  "$MODEL_PATH" \
+  --layer 3 \
+  --expert 31 \
+  --threads "$KT_CPU_THREADS" \
+  --numa-nodes 0 1
+```
+
+Both backends should report `status=PASS`. If only
+`AMXFP4_KGroup_MOE` fails, relaunch temporarily with
+`KT_MXFP4_BACKEND=avx2` to isolate the AVX512 implementation.
+
 For performance measurement, warm the server first and compare prompt and
 decode throughput separately. Record `KT_GPU_EXPERTS`, CPU affinity, NUMA
 placement, prompt length, concurrency, and whether CUDA graphs were captured.
