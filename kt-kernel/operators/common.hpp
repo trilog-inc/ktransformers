@@ -10,10 +10,12 @@
 #include <arm_sve.h>
 #endif
 
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 #include <type_traits>
 
@@ -279,6 +281,11 @@ struct GeneralMOEConfig {
   std::vector<std::vector<void*>> gate_scales;
   std::vector<std::vector<void*>> up_scales;
   std::vector<std::vector<void*>> down_scales;
+  // ModelOpt NVFP4 projection-level FP32 scales. The per-block tensors above
+  // remain in their native E4M3 byte representation until NUMA-local loading.
+  std::vector<std::vector<void*>> gate_scale2s;
+  std::vector<std::vector<void*>> up_scale2s;
+  std::vector<std::vector<void*>> down_scale2s;
   std::vector<std::vector<void*>> gate_zeros;
   std::vector<std::vector<void*>> up_zeros;
   std::vector<std::vector<void*>> down_zeros;
@@ -468,6 +475,30 @@ void convert_or_copy(A* dst, const B* src, size_t count) {
     }
   }
 }
+
+inline float e4m3fn_to_fp32(uint8_t bits) {
+  const bool negative = (bits & 0x80U) != 0;
+  const int exponent = (bits >> 3) & 0x0F;
+  const int mantissa = bits & 0x07;
+
+  float value;
+  if (exponent == 0) {
+    value = std::ldexp(static_cast<float>(mantissa), -9);
+  } else if (exponent == 0x0F && mantissa == 0x07) {
+    value = std::numeric_limits<float>::quiet_NaN();
+  } else {
+    value = std::ldexp(1.0f + static_cast<float>(mantissa) * 0.125f, exponent - 7);
+  }
+  return negative ? -value : value;
+}
+
+alignas(64) inline const std::array<float, 256> kE4M3FNLut = [] {
+  std::array<float, 256> values{};
+  for (size_t i = 0; i < values.size(); ++i) values[i] = e4m3fn_to_fp32(static_cast<uint8_t>(i));
+  return values;
+}();
+
+inline const std::array<float, 256>& e4m3fn_lut() { return kE4M3FNLut; }
 
 template <typename A>
 void convert_or_copy(A* dst, void* src, ggml_type type, size_t count) {

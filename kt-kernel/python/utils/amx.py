@@ -17,6 +17,7 @@ from .loader import (
     BF16SafeTensorLoader,
     GPTQSafeTensorLoader,
     MXFP4SafeTensorLoader,
+    NVFP4SafeTensorLoader,
     MXFP8SafeTensorLoader,
 )
 from kt_kernel_ext.moe import MOEConfig
@@ -76,6 +77,10 @@ def _host_has_cpu_flag(*flag_names: str) -> bool:
 
 
 _HOST_HAS_AVX_VNNI = _host_has_cpu_flag("avx_vnni", "avxvnni")
+_HOST_HAS_AVX512_BF16 = all(
+    _host_has_cpu_flag(flag)
+    for flag in ("avx512f", "avx512bw", "avx512_bf16")
+)
 
 
 def _preflight_sycl_device() -> None:
@@ -190,6 +195,11 @@ def _select_mxfp4_backend():
                 "KT_MXFP4_BACKEND=amx requested, but AMXFP4_KGroup_MOE is not compiled in. "
                 "Recompile with AVX512F + AVX512BW + AVX512_BF16 enabled."
             )
+        if not _HOST_HAS_AVX512_BF16:
+            raise RuntimeError(
+                "KT_MXFP4_BACKEND=amx requested, but the current CPU lacks "
+                "AVX-512 BF16 support. Unset the variable to fall back to AVX2."
+            )
         return AMXFP4_KGroup_MOE
 
     if forced == "avx2":
@@ -200,7 +210,7 @@ def _select_mxfp4_backend():
             )
         return AVX2MXFP4_MOE
 
-    if _HAS_MXFP4_SUPPORT:
+    if _HAS_MXFP4_SUPPORT and _HOST_HAS_AVX512_BF16:
         return AMXFP4_KGroup_MOE
     if _HAS_AVX2_MXFP4_SUPPORT:
         return AVX2MXFP4_MOE
@@ -583,11 +593,16 @@ class NativeMoEWrapper(BaseMoEWrapper):
         # by GLM-5-Next's E4M3 + FP32 [128, 128] checkpoint format.
         # if the experts.py guard is bypassed (e.g., by a future caller
         # that constructs NativeMoEWrapper directly). Origin: kt-sglang 耦合.
-        if swiglu_limit != 0.0 and method not in ("FP8", "MXFP4", "MXFP8"):
+        if swiglu_limit != 0.0 and method not in (
+            "FP8",
+            "MXFP4",
+            "NVFP4",
+            "MXFP8",
+        ):
             raise ValueError(
                 f"NativeMoEWrapper received swiglu_limit={swiglu_limit} with "
                 f"method={method!r}; the clamp is supported only by "
-                "FP8/MXFP4/MXFP8. "
+                "FP8/MXFP4/NVFP4/MXFP8. "
                 f"This indicates a missing guard in the caller."
             )
         if method == "RAWINT4" and not (
@@ -638,6 +653,13 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 "  - AVX2 + FMA (for AVX2 fallback backend)\n"
                 "Please recompile kt_kernel_ext with one of the above enabled."
             )
+        if method == "NVFP4" and not (_HAS_MXFP4_SUPPORT or _HAS_AVX2_MXFP4_SUPPORT):
+            raise RuntimeError(
+                "NVFP4 backend not available. Required ISA (any one of):\n"
+                "  - AVX512F + AVX512BW + AVX512_BF16 (for AMX/AVX-512 backend)\n"
+                "  - AVX2 + FMA (for AVX2 fallback backend)\n"
+                "Please recompile kt_kernel_ext with one of the above enabled."
+            )
         if method == "MXFP8" and not (_HAS_MXFP8_SUPPORT or _HAS_AVX2_MXFP8_SUPPORT):
             raise RuntimeError(
                 "MXFP8 backend not available. Required ISA (any one of):\n"
@@ -674,6 +696,9 @@ class NativeMoEWrapper(BaseMoEWrapper):
         self.gate_scales = None
         self.up_scales = None
         self.down_scales = None
+        self.gate_scale2s = None
+        self.up_scale2s = None
+        self.down_scale2s = None
 
     @staticmethod
     def _create_loader(method: str, weight_path: str):
@@ -689,6 +714,8 @@ class NativeMoEWrapper(BaseMoEWrapper):
             return GPTQSafeTensorLoader(weight_path)
         elif method == "MXFP4":
             return MXFP4SafeTensorLoader(weight_path)
+        elif method == "NVFP4":
+            return NVFP4SafeTensorLoader(weight_path)
         elif method == "MXFP8":
             return MXFP8SafeTensorLoader(weight_path)
         else:
@@ -737,6 +764,40 @@ class NativeMoEWrapper(BaseMoEWrapper):
             self.loader = NativeMoEWrapper._native_loader_instance
 
         t0 = time.time()
+        nvfp4_cpu_logical_ids = None
+        if self.method == "NVFP4":
+            if self.hidden_size % 32 or self.moe_intermediate_size % 32:
+                raise ValueError(
+                    "Native NVFP4 kernels require hidden and intermediate "
+                    "dimensions divisible by 32; got "
+                    f"hidden={self.hidden_size}, intermediate="
+                    f"{self.moe_intermediate_size}"
+                )
+            if physical_to_logical_map_cpu.numel() != self.num_experts:
+                raise ValueError(
+                    "NVFP4 physical_to_logical_map has "
+                    f"{physical_to_logical_map_cpu.numel()} entries; expected "
+                    f"{self.num_experts}"
+                )
+            cpu_physical_ids = torch.where(~self.gpu_experts_mask)[0]
+            nvfp4_cpu_logical_ids = sorted(
+                {
+                    int(expert_id)
+                    for expert_id in physical_to_logical_map_cpu[
+                        cpu_physical_ids
+                    ].tolist()
+                }
+            )
+            invalid_logical_ids = [
+                expert_id
+                for expert_id in nvfp4_cpu_logical_ids
+                if expert_id < 0 or expert_id >= self.num_experts
+            ]
+            if invalid_logical_ids:
+                raise ValueError(
+                    "NVFP4 physical_to_logical_map contains invalid ids: "
+                    f"{invalid_logical_ids}"
+                )
         _candidates = (
             [self.weight_base_key]
             if self.weight_base_key is not None
@@ -749,9 +810,20 @@ class NativeMoEWrapper(BaseMoEWrapper):
         weights = None
         for base_key in _candidates:
             try:
-                weights = self.loader.load_experts(base_key)
+                if self.method == "NVFP4":
+                    weights = self.loader.load_experts(
+                        base_key, expert_ids=nvfp4_cpu_logical_ids
+                    )
+                else:
+                    weights = self.loader.load_experts(base_key)
                 break
-            except (ValueError, KeyError):
+            except ValueError as exc:
+                if self.method == "NVFP4" and not str(exc).startswith(
+                    "No ModelOpt NVFP4 experts found"
+                ):
+                    raise
+                continue
+            except KeyError:
                 continue
         if weights is None:
             raise ValueError(f"No experts found for layer {self.layer_idx} under any prefix: {_candidates}")
@@ -795,6 +867,78 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 # ue8m0 is losslessly representable in bf16 (8-bit exponent, 0 mantissa);
                 # the loader has already done that conversion.
                 assert self.gate_scales[0].dtype == torch.bfloat16, "Expected bf16 scales for MXFP4"
+            elif self.method == "NVFP4":
+                valid_scale_dtypes = (torch.float8_e4m3fn, torch.uint8)
+                self.gate_scale2s = weights["gate_scale_2"]
+                self.up_scale2s = weights["up_scale_2"]
+                self.down_scale2s = weights["down_scale_2"]
+                tensors = (
+                    ("gate", self.gate_weights, (self.moe_intermediate_size, self.hidden_size // 2), torch.uint8),
+                    ("up", self.up_weights, (self.moe_intermediate_size, self.hidden_size // 2), torch.uint8),
+                    ("down", self.down_weights, (self.hidden_size, self.moe_intermediate_size // 2), torch.uint8),
+                    (
+                        "gate_scale",
+                        self.gate_scales,
+                        (self.moe_intermediate_size, self.hidden_size // 16),
+                        valid_scale_dtypes,
+                    ),
+                    (
+                        "up_scale",
+                        self.up_scales,
+                        (self.moe_intermediate_size, self.hidden_size // 16),
+                        valid_scale_dtypes,
+                    ),
+                    (
+                        "down_scale",
+                        self.down_scales,
+                        (self.hidden_size, self.moe_intermediate_size // 16),
+                        valid_scale_dtypes,
+                    ),
+                )
+                for name, values, expected_shape, expected_dtype in tensors:
+                    if len(values) != self.num_experts:
+                        raise ValueError(
+                            f"NVFP4 {name} has {len(values)} experts; expected {self.num_experts}"
+                        )
+                    for expert_id, tensor in enumerate(values):
+                        if tensor is None:
+                            if expert_id in nvfp4_cpu_logical_ids:
+                                raise ValueError(
+                                    f"NVFP4 {name}[{expert_id}] was not loaded"
+                                )
+                            continue
+                        if tuple(tensor.shape) != expected_shape:
+                            raise ValueError(
+                                f"NVFP4 {name}[{expert_id}] has shape {tuple(tensor.shape)}; "
+                                f"expected {expected_shape}"
+                            )
+                        allowed = (
+                            expected_dtype
+                            if isinstance(expected_dtype, tuple)
+                            else (expected_dtype,)
+                        )
+                        if tensor.dtype not in allowed:
+                            raise TypeError(
+                                f"NVFP4 {name}[{expert_id}] has dtype {tensor.dtype}; "
+                                f"expected one of {allowed}"
+                            )
+                for name, values in (
+                    ("gate_scale_2", self.gate_scale2s),
+                    ("up_scale_2", self.up_scale2s),
+                    ("down_scale_2", self.down_scale2s),
+                ):
+                    if len(values) != self.num_experts:
+                        raise ValueError(
+                            f"NVFP4 {name} has {len(values)} experts; expected {self.num_experts}"
+                        )
+                    if any(
+                        t is not None
+                        and (t.dtype != torch.float32 or t.numel() != 1)
+                        for t in values
+                    ):
+                        raise TypeError(
+                            f"NVFP4 {name} must contain one FP32 scalar per expert"
+                        )
             elif self.method == "MXFP8":
                 # ue8m0 scales stay as uint8; C++ convert_ue8m0_to_fp32 handles conversion.
                 assert self.gate_scales[0].dtype == torch.uint8, "Expected uint8 (ue8m0) scales for MXFP8"
@@ -803,9 +947,15 @@ class NativeMoEWrapper(BaseMoEWrapper):
 
         # Build pointer lists: [numa_id][expert_id] -> pointer
         # Since RAWINT4/FP8/BF16 has no numa sharding, numa dimension is 1
-        gate_ptrs = [[t.data_ptr() for t in self.gate_weights]]
-        up_ptrs = [[t.data_ptr() for t in self.up_weights]]
-        down_ptrs = [[t.data_ptr() for t in self.down_weights]]
+        gate_ptrs = [
+            [t.data_ptr() if t is not None else 0 for t in self.gate_weights]
+        ]
+        up_ptrs = [
+            [t.data_ptr() if t is not None else 0 for t in self.up_weights]
+        ]
+        down_ptrs = [
+            [t.data_ptr() if t is not None else 0 for t in self.down_weights]
+        ]
 
         # BF16 has no scales, pass empty lists (will use 0/nullptr for consistency)
         if self.method == "BF16":
@@ -813,9 +963,25 @@ class NativeMoEWrapper(BaseMoEWrapper):
             up_scale_ptrs = [[0 for _ in self.up_weights]]
             down_scale_ptrs = [[0 for _ in self.down_weights]]
         else:
-            gate_scale_ptrs = [[t.data_ptr() for t in self.gate_scales]]
-            up_scale_ptrs = [[t.data_ptr() for t in self.up_scales]]
-            down_scale_ptrs = [[t.data_ptr() for t in self.down_scales]]
+            gate_scale_ptrs = [
+                [t.data_ptr() if t is not None else 0 for t in self.gate_scales]
+            ]
+            up_scale_ptrs = [
+                [t.data_ptr() if t is not None else 0 for t in self.up_scales]
+            ]
+            down_scale_ptrs = [
+                [t.data_ptr() if t is not None else 0 for t in self.down_scales]
+            ]
+        if self.method == "NVFP4":
+            gate_scale2_ptrs = [
+                [t.data_ptr() if t is not None else 0 for t in self.gate_scale2s]
+            ]
+            up_scale2_ptrs = [
+                [t.data_ptr() if t is not None else 0 for t in self.up_scale2s]
+            ]
+            down_scale2_ptrs = [
+                [t.data_ptr() if t is not None else 0 for t in self.down_scale2s]
+            ]
         t3 = time.time()
 
         moe_config = MOEConfig(
@@ -838,12 +1004,13 @@ class NativeMoEWrapper(BaseMoEWrapper):
         if self.swiglu_limit != 0.0 and self.method not in (
             "FP8",
             "MXFP4",
+            "NVFP4",
             "MXFP8",
         ):
             raise ValueError(
                 f"NativeMoEWrapper.load_weights: swiglu_limit="
                 f"{self.swiglu_limit} with method={self.method!r}; clamp is "
-                f"only valid for FP8/MXFP4/MXFP8."
+                f"only valid for FP8/MXFP4/NVFP4/MXFP8."
             )
         moe_config.swiglu_limit = self.swiglu_limit
 
@@ -854,6 +1021,10 @@ class NativeMoEWrapper(BaseMoEWrapper):
         moe_config.gate_scales = gate_scale_ptrs
         moe_config.up_scales = up_scale_ptrs
         moe_config.down_scales = down_scale_ptrs
+        if self.method == "NVFP4":
+            moe_config.gate_scale2s = gate_scale2_ptrs
+            moe_config.up_scale2s = up_scale2_ptrs
+            moe_config.down_scale2s = down_scale2_ptrs
 
         # Infer group_size from scale shape (column-major layout)
         # For gate/up projection: in_features = hidden_size
@@ -885,6 +1056,24 @@ class NativeMoEWrapper(BaseMoEWrapper):
                 raise RuntimeError(
                     "No MXFP4 backend available after runtime selection. "
                     "Compile with AVX512_BF16 (AMXFP4_KGroup_MOE) or AVX2 (AVX2MXFP4_MOE)."
+                )
+            self.moe = backend_cls(moe_config)
+        elif self.method == "NVFP4":
+            # ModelOpt NVFP4: E2M1 weights, E4M3 per-16 block scales, and a
+            # separate FP32 tensor scale per projection. The C++ path keeps
+            # E4M3 scales byte-packed in NUMA-local buffers and applies the
+            # projection scale once after FP32 accumulation.
+            group_size = 16
+            moe_config.quant_config.quant_method = "NVFP4"
+            moe_config.quant_config.bits = 4
+            moe_config.quant_config.group_size = group_size
+            moe_config.quant_config.zero_point = False
+            backend_cls = _select_mxfp4_backend()
+            if backend_cls is None:
+                raise RuntimeError(
+                    "No NVFP4 backend available after runtime selection. "
+                    "Compile with AVX512_BF16 (AMXFP4_KGroup_MOE) or AVX2 "
+                    "(AVX2MXFP4_MOE)."
                 )
             self.moe = backend_cls(moe_config)
         elif self.method == "MXFP8":
@@ -961,6 +1150,10 @@ class NativeMoEWrapper(BaseMoEWrapper):
             del self.gate_scales
             del self.up_scales
             del self.down_scales
+        if self.gate_scale2s is not None:
+            del self.gate_scale2s
+            del self.up_scale2s
+            del self.down_scale2s
 
         if self.release_loader_after_load:
             NativeMoEWrapper._release_loader(layer_idx=self.layer_idx)

@@ -865,6 +865,9 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
       .DEF_PTR_2D_PROPERTY(GeneralMOEConfig, gate_scales)
       .DEF_PTR_2D_PROPERTY(GeneralMOEConfig, up_scales)
       .DEF_PTR_2D_PROPERTY(GeneralMOEConfig, down_scales)
+      .DEF_PTR_2D_PROPERTY(GeneralMOEConfig, gate_scale2s)
+      .DEF_PTR_2D_PROPERTY(GeneralMOEConfig, up_scale2s)
+      .DEF_PTR_2D_PROPERTY(GeneralMOEConfig, down_scale2s)
 
       .DEF_PTR_2D_PROPERTY(GeneralMOEConfig, gate_zeros)
       .DEF_PTR_2D_PROPERTY(GeneralMOEConfig, up_zeros)

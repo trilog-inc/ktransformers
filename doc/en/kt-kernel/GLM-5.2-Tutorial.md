@@ -260,6 +260,7 @@ This tutorial uses `--port 8000`. If you use `kt chat`, pass `--port 8000`; if y
 
 - [GLM-5.2 Model Card](https://huggingface.co/zai-org/GLM-5.2)
 - [GLM-5.2-FP8 Model Card](https://huggingface.co/zai-org/GLM-5.2-FP8)
+- [GLM-5.2 NVFP4 on SM120 with KT-Kernel](GLM-5.2-NVFP4-Tutorial.md)
 - [KT-Kernel Documentation](../../../kt-kernel/README.md)
 - [SGLang GitHub](https://github.com/sgl-project/sglang)
 - [KT-Kernel Parameters Reference](../../../kt-kernel/README.md#kt-kernel-parameters)

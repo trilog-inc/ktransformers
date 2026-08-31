@@ -9,11 +9,13 @@ This module provides loaders for:
 from __future__ import annotations
 
 import os
+from collections.abc import Collection
+from enum import IntEnum
+
 import numpy as np
 import torch
-from enum import IntEnum
-from safetensors import safe_open
 from gguf.gguf_reader import GGUFReader
+from safetensors import safe_open
 
 
 class GGMLQuantizationType(IntEnum):
@@ -1268,6 +1270,143 @@ class MXFP4SafeTensorLoader(SafeTensorLoader):
             "up_scale": up_scales,
             "down_scale": down_scales,
         }
+
+
+class NVFP4SafeTensorLoader(SafeTensorLoader):
+    """Loader for serialized ModelOpt NVFP4 routed experts.
+
+    ModelOpt stores two E2M1 values per weight byte, one E4M3 block scale per
+    16 input values, and an FP32 tensor scale for each projection.  Keep all
+    three tensors in their checkpoint representation. The native C++ loader
+    copies the packed weights and block scales directly into NUMA-local compute
+    buffers and applies the projection scale after accumulation.
+    """
+
+    EXPERTS_PATH_TPL = "{base}.mlp.experts"
+    PROJ_NAMES = ("gate_proj", "up_proj", "down_proj")
+
+    def _experts_prefix_candidates(self, base_key: str) -> list[str]:
+        candidates = [self.EXPERTS_PATH_TPL.format(base=base_key)]
+        for strip in (
+            "language_model.model.",
+            "language_model.",
+            "model.language_model.",
+            "model.",
+        ):
+            if base_key.startswith(strip):
+                candidates.append(
+                    self.EXPERTS_PATH_TPL.format(base=base_key[len(strip) :])
+                )
+        return list(dict.fromkeys(candidates))
+
+    @staticmethod
+    def _packed_weight(tensor: torch.Tensor) -> torch.Tensor:
+        tensor = tensor.contiguous()
+        if tensor.dtype != torch.uint8:
+            raise TypeError(
+                "NVFP4 weight must contain two packed E2M1 values per uint8, "
+                f"got {tensor.dtype}"
+            )
+        return tensor
+
+    @staticmethod
+    def _e4m3_scale(tensor: torch.Tensor) -> torch.Tensor:
+        tensor = tensor.contiguous()
+        if tensor.dtype not in (torch.float8_e4m3fn, torch.uint8):
+            raise TypeError(
+                "NVFP4 weight_scale must be FP8 E4M3 or its uint8 bit view, "
+                f"got {tensor.dtype}"
+            )
+        return tensor
+
+    @staticmethod
+    def _global_scale(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.dtype != torch.float32:
+            raise TypeError(
+                f"NVFP4 weight_scale_2 must be FP32, got {tensor.dtype}"
+            )
+        tensor = tensor.reshape(-1).contiguous()
+        if tensor.numel() != 1:
+            raise ValueError(
+                "NVFP4 weight_scale_2 must contain one FP32 value per projection, "
+                f"got shape {tuple(tensor.shape)}"
+            )
+        return tensor
+
+    def load_experts(
+        self,
+        base_key: str,
+        device: str = "cpu",
+        expert_ids: Collection[int] | None = None,
+    ):
+        gate_name, up_name, down_name = self.PROJ_NAMES
+        prefix = None
+        expert_count = 0
+        for candidate in self._experts_prefix_candidates(base_key):
+            expert_count = 0
+            while self.has_tensor(
+                f"{candidate}.{expert_count}.{gate_name}.weight"
+            ):
+                expert_count += 1
+            if expert_count:
+                prefix = candidate
+                break
+        if prefix is None:
+            raise ValueError(
+                "No ModelOpt NVFP4 experts found under any of: "
+                f"{self._experts_prefix_candidates(base_key)}"
+            )
+
+        selected_experts = (
+            list(range(expert_count))
+            if expert_ids is None
+            else sorted({int(expert_id) for expert_id in expert_ids})
+        )
+        invalid_experts = [
+            expert_id
+            for expert_id in selected_experts
+            if expert_id < 0 or expert_id >= expert_count
+        ]
+        if invalid_experts:
+            raise ValueError(
+                f"NVFP4 requested invalid expert ids {invalid_experts}; "
+                f"checkpoint contains {expert_count} experts"
+            )
+
+        result = {
+            "gate": [None] * expert_count,
+            "up": [None] * expert_count,
+            "down": [None] * expert_count,
+            "gate_scale": [None] * expert_count,
+            "up_scale": [None] * expert_count,
+            "down_scale": [None] * expert_count,
+            "gate_scale_2": [None] * expert_count,
+            "up_scale_2": [None] * expert_count,
+            "down_scale_2": [None] * expert_count,
+        }
+        projections = (
+            (gate_name, "gate"),
+            (up_name, "up"),
+            (down_name, "down"),
+        )
+        for expert_id in selected_experts:
+            for projection_name, result_name in projections:
+                key = f"{prefix}.{expert_id}.{projection_name}"
+                result[result_name][expert_id] = self._packed_weight(
+                    self.load_tensor(f"{key}.weight", device)
+                )
+                result[f"{result_name}_scale"][expert_id] = self._e4m3_scale(
+                    self.load_tensor(f"{key}.weight_scale", device)
+                )
+                result[f"{result_name}_scale_2"][expert_id] = self._global_scale(
+                    self.load_tensor(f"{key}.weight_scale_2", device)
+                )
+
+        print(
+            f"[NVFP4SafeTensorLoader] Loaded {len(selected_experts)} of "
+            f"{expert_count} experts from {prefix}"
+        )
+        return result
 
 
 class MXFP8SafeTensorLoader(SafeTensorLoader):

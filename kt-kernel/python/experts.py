@@ -41,6 +41,7 @@ INFERENCE_METHODS = frozenset(
         "GPTQ_INT4",  # GPTQ INT4
         "SYCL_GPTQ_INT4",  # GPTQ INT4 experts on a SYCL device
         "MXFP4",  # MXFP4 (E2M1 nibble + ue8m0 group scale, e.g. DeepSeek-V4-Flash routed experts)
+        "NVFP4",  # ModelOpt NVFP4 (E2M1 + E4M3 per-16 scale + FP32 tensor scale)
         "MXFP8",  # MXFP8 (E4M3fn byte + ue8m0 group scale, e.g. MiniMax-M3-Preview)
         "LLAMAFILE",  # GGUF format
         "MOE_INT4",
@@ -367,6 +368,7 @@ def _create_inference_wrapper(
         "GPTQ_INT4",
         "SYCL_GPTQ_INT4",
         "MXFP4",
+        "NVFP4",
         "MXFP8",
     ]:
         backend_cls = NativeMoEWrapper
@@ -379,7 +381,7 @@ def _create_inference_wrapper(
         raise NotImplementedError(f"Unsupported inference method: {method}")
 
     # Create and return backend instance.
-    # `swiglu_limit != 0` is validated for block-FP8, MXFP4, and MXFP8.
+    # `swiglu_limit != 0` is validated for block-FP8, MXFP4, NVFP4, and MXFP8.
     # NativeMoEWrapper also serves RAWINT4 / BF16 / FP8_PERCHANNEL / GPTQ_INT4, so a
     # `backend_cls is NativeMoEWrapper` test would silently forward a stale
     # 10.0 (e.g., from a leftover SGLANG_DSV4_2604_SUBMODE=2604B in the env)
@@ -400,17 +402,17 @@ def _create_inference_wrapper(
                 f"SafeTensor backends, got method={method!r}."
             )
         extra_kwargs["release_loader_after_load"] = False
-    if method in ("FP8", "MXFP4", "MXFP8"):
+    if method in ("FP8", "MXFP4", "NVFP4", "MXFP8"):
         extra_kwargs["swiglu_limit"] = swiglu_limit
         extra_kwargs["swiglu_alpha"] = swiglu_alpha
     elif swiglu_limit != 0.0:
         raise ValueError(
             f"swiglu_limit={swiglu_limit} is only supported on "
-            "method='FP8'/'MXFP4'/'MXFP8', "
+            "method='FP8'/'MXFP4'/'NVFP4'/'MXFP8', "
             f"got method={method!r} (backend={backend_cls.__name__}). This "
             f"usually means SGLANG_DSV4_2604_SUBMODE=2604B is set in the "
             f"environment while the current launch does not actually use "
-            "FP8/MXFP4/MXFP8 weights — either unset the env or select a "
+            "FP8/MXFP4/NVFP4/MXFP8 weights — either unset the env or select a "
             "matching --kt-method."
         )
     return backend_cls(

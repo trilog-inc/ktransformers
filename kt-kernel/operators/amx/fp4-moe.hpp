@@ -138,6 +138,24 @@ struct GemmKernel224MXFP4SmallKGroup {
 #endif
   }
 
+  template <int GROUP_SIZE>
+  __attribute__((always_inline)) static inline __m512 load_group_scales(const void* scale_data, int vector_idx) {
+    static_assert(GROUP_SIZE == 16 || GROUP_SIZE == 32);
+    if constexpr (GROUP_SIZE == 32) {
+      const float* scales = static_cast<const float*>(scale_data);
+      return _mm512_set1_ps(scales[vector_idx]);
+    } else {
+      const uint8_t* scales = static_cast<const uint8_t*>(scale_data);
+      const auto& lut = e4m3fn_lut();
+      const __m512 first = _mm512_set1_ps(lut[scales[vector_idx * 2]]);
+      const __m512 second = _mm512_set1_ps(lut[scales[vector_idx * 2 + 1]]);
+      // DPBF16 produces 16 FP32 lanes, each reducing two adjacent BF16
+      // products. Lanes 0..7 belong to the first NVFP4 group and lanes 8..15
+      // to the second.
+      return _mm512_mask_blend_ps(0xFF00, first, second);
+    }
+  }
+
   // Buffers
   using BufferA = BufferABF16Impl<GemmKernel224MXFP4SmallKGroup>;        // raw BF16, no quant
   using BufferB = BufferBInt4KGroupImpl<GemmKernel224MXFP4SmallKGroup>;  // nibble-packed FP4
@@ -145,16 +163,24 @@ struct GemmKernel224MXFP4SmallKGroup {
 
   // 4 个 zmm 的 horizontal reduce → 4 个连续 fp32。
   // 4 次 reduce_add_ps 之间无依赖，编译器/CPU 可并行调度。
-  __attribute__((always_inline)) static inline void reduce4(__m512 s0, __m512 s1, __m512 s2, __m512 s3, float* dst) {
-    dst[0] = _mm512_reduce_add_ps(s0);
-    dst[1] = _mm512_reduce_add_ps(s1);
-    dst[2] = _mm512_reduce_add_ps(s2);
-    dst[3] = _mm512_reduce_add_ps(s3);
+  template <int GROUP_SIZE>
+  __attribute__((always_inline)) static inline float finalize(float value, const BufferB* bb) {
+    if constexpr (GROUP_SIZE == 16) return value * bb->tensor_scale;
+    return value;
+  }
+
+  template <int GROUP_SIZE>
+  __attribute__((always_inline)) static inline void reduce4(__m512 s0, __m512 s1, __m512 s2, __m512 s3, float* dst,
+                                                             const BufferB* bb) {
+    dst[0] = finalize<GROUP_SIZE>(_mm512_reduce_add_ps(s0), bb);
+    dst[1] = finalize<GROUP_SIZE>(_mm512_reduce_add_ps(s1), bb);
+    dst[2] = finalize<GROUP_SIZE>(_mm512_reduce_add_ps(s2), bb);
+    dst[3] = finalize<GROUP_SIZE>(_mm512_reduce_add_ps(s3), bb);
   }
 
   // mat-vec: M 个独立 token，N 维 4 行一组累加，摊销 horizontal reduce。
-  static void fp4_mat_vec_kgroup(int m, int n, int k, int k_group_size, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
-                                 int nth) {
+  template <int GROUP_SIZE>
+  static void fp4_mat_vec_kgroup_impl(int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith, int nth) {
     auto [n_start, n_end] = split_range_n(n, ith, nth);
     if (n_start >= n_end) return;
     const int kg_count = k / 32;
@@ -170,10 +196,14 @@ struct GemmKernel224MXFP4SmallKGroup {
         __m128i* w1 = (__m128i*)bb->get_submat(n, k, n_pos + 1, 0);
         __m128i* w2 = (__m128i*)bb->get_submat(n, k, n_pos + 2, 0);
         __m128i* w3 = (__m128i*)bb->get_submat(n, k, n_pos + 3, 0);
-        const float* s0 = bb->get_scale(n, n_pos + 0, k, 0);
-        const float* s1 = bb->get_scale(n, n_pos + 1, k, 0);
-        const float* s2 = bb->get_scale(n, n_pos + 2, k, 0);
-        const float* s3 = bb->get_scale(n, n_pos + 3, k, 0);
+        const void* s0 = GROUP_SIZE == 16 ? static_cast<const void*>(bb->get_native_scale(n, n_pos + 0, k, 0))
+                                          : static_cast<const void*>(bb->get_scale(n, n_pos + 0, k, 0));
+        const void* s1 = GROUP_SIZE == 16 ? static_cast<const void*>(bb->get_native_scale(n, n_pos + 1, k, 0))
+                                          : static_cast<const void*>(bb->get_scale(n, n_pos + 1, k, 0));
+        const void* s2 = GROUP_SIZE == 16 ? static_cast<const void*>(bb->get_native_scale(n, n_pos + 2, k, 0))
+                                          : static_cast<const void*>(bb->get_scale(n, n_pos + 2, k, 0));
+        const void* s3 = GROUP_SIZE == 16 ? static_cast<const void*>(bb->get_native_scale(n, n_pos + 3, k, 0))
+                                          : static_cast<const void*>(bb->get_scale(n, n_pos + 3, k, 0));
 
         __m512 acc0 = _mm512_setzero_ps();
         __m512 acc1 = _mm512_setzero_ps();
@@ -186,33 +216,45 @@ struct GemmKernel224MXFP4SmallKGroup {
           const DequantizedWeight d1(w1[g]);
           const DequantizedWeight d2(w2[g]);
           const DequantizedWeight d3(w3[g]);
-          acc0 = _mm512_fmadd_ps(_mm512_set1_ps(s0[g]), mxfp4_dot_bf16(d0, a), acc0);
-          acc1 = _mm512_fmadd_ps(_mm512_set1_ps(s1[g]), mxfp4_dot_bf16(d1, a), acc1);
-          acc2 = _mm512_fmadd_ps(_mm512_set1_ps(s2[g]), mxfp4_dot_bf16(d2, a), acc2);
-          acc3 = _mm512_fmadd_ps(_mm512_set1_ps(s3[g]), mxfp4_dot_bf16(d3, a), acc3);
+          acc0 = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s0, g), mxfp4_dot_bf16(d0, a), acc0);
+          acc1 = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s1, g), mxfp4_dot_bf16(d1, a), acc1);
+          acc2 = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s2, g), mxfp4_dot_bf16(d2, a), acc2);
+          acc3 = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s3, g), mxfp4_dot_bf16(d3, a), acc3);
         }
-        reduce4(acc0, acc1, acc2, acc3, c_row + (n_pos - n_start));
+        reduce4<GROUP_SIZE>(acc0, acc1, acc2, acc3, c_row + (n_pos - n_start), bb);
       }
       // N 尾巴: N % 4 != 0 时单行 fallback
       for (; n_pos < n_end; n_pos++) {
         __m128i* w = (__m128i*)bb->get_submat(n, k, n_pos, 0);
-        const float* s = bb->get_scale(n, n_pos, k, 0);
+        const void* s = GROUP_SIZE == 16 ? static_cast<const void*>(bb->get_native_scale(n, n_pos, k, 0))
+                                         : static_cast<const void*>(bb->get_scale(n, n_pos, k, 0));
         __m512 acc = _mm512_setzero_ps();
         for (int g = 0; g < kg_count; g++) {
           const ActivationBF16 a(a_row[g]);
           const DequantizedWeight d(w[g]);
-          acc = _mm512_fmadd_ps(_mm512_set1_ps(s[g]), mxfp4_dot_bf16(d, a), acc);
+          acc = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s, g), mxfp4_dot_bf16(d, a), acc);
         }
-        c_row[n_pos - n_start] = _mm512_reduce_add_ps(acc);
+        c_row[n_pos - n_start] = finalize<GROUP_SIZE>(_mm512_reduce_add_ps(acc), bb);
       }
+    }
+  }
+
+  static void fp4_mat_vec_kgroup(int m, int n, int k, int k_group_size, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
+                                 int nth) {
+    if (k_group_size == 16) {
+      fp4_mat_vec_kgroup_impl<16>(m, n, k, ba, bb, bc, ith, nth);
+    } else if (k_group_size == 32) {
+      fp4_mat_vec_kgroup_impl<32>(m, n, k, ba, bb, bc, ith, nth);
+    } else {
+      throw std::runtime_error("FP4 AMX supports only group sizes 16 and 32");
     }
   }
 
   // mat-mat: 4×4 register tile (M_TILE=4, N_TILE=4 → 16 累加器)。
   // 每 K-group 解码 4 行 N 一次, 被 4 个 token 共享 → PSHUFB 解码开销 / 4。
   // M / N 尾巴回退到 mat-vec 单 token 内层 (V4 chunked-prefill 16/32/64 整数倍, 极少触发)。
-  static void fp4_mat_mat_kgroup(int m, int n, int k, int k_group_size, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
-                                 int nth) {
+  template <int GROUP_SIZE>
+  static void fp4_mat_mat_kgroup_impl(int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith, int nth) {
     auto [n_start, n_end] = split_range_n(n, ith, nth);
     if (n_start >= n_end) return;
     const int kg_count = k / 32;
@@ -234,10 +276,14 @@ struct GemmKernel224MXFP4SmallKGroup {
         __m128i* w1 = (__m128i*)bb->get_submat(n, k, n_pos + 1, 0);
         __m128i* w2 = (__m128i*)bb->get_submat(n, k, n_pos + 2, 0);
         __m128i* w3 = (__m128i*)bb->get_submat(n, k, n_pos + 3, 0);
-        const float* s0 = bb->get_scale(n, n_pos + 0, k, 0);
-        const float* s1 = bb->get_scale(n, n_pos + 1, k, 0);
-        const float* s2 = bb->get_scale(n, n_pos + 2, k, 0);
-        const float* s3 = bb->get_scale(n, n_pos + 3, k, 0);
+        const void* s0 = GROUP_SIZE == 16 ? static_cast<const void*>(bb->get_native_scale(n, n_pos + 0, k, 0))
+                                          : static_cast<const void*>(bb->get_scale(n, n_pos + 0, k, 0));
+        const void* s1 = GROUP_SIZE == 16 ? static_cast<const void*>(bb->get_native_scale(n, n_pos + 1, k, 0))
+                                          : static_cast<const void*>(bb->get_scale(n, n_pos + 1, k, 0));
+        const void* s2 = GROUP_SIZE == 16 ? static_cast<const void*>(bb->get_native_scale(n, n_pos + 2, k, 0))
+                                          : static_cast<const void*>(bb->get_scale(n, n_pos + 2, k, 0));
+        const void* s3 = GROUP_SIZE == 16 ? static_cast<const void*>(bb->get_native_scale(n, n_pos + 3, k, 0))
+                                          : static_cast<const void*>(bb->get_scale(n, n_pos + 3, k, 0));
 
         __m512 acc[MB][NB];
         for (int i = 0; i < MB; i++)
@@ -249,10 +295,10 @@ struct GemmKernel224MXFP4SmallKGroup {
           const DequantizedWeight d1(w1[g]);
           const DequantizedWeight d2(w2[g]);
           const DequantizedWeight d3(w3[g]);
-          const __m512 sv0 = _mm512_set1_ps(s0[g]);
-          const __m512 sv1 = _mm512_set1_ps(s1[g]);
-          const __m512 sv2 = _mm512_set1_ps(s2[g]);
-          const __m512 sv3 = _mm512_set1_ps(s3[g]);
+          const __m512 sv0 = load_group_scales<GROUP_SIZE>(s0, g);
+          const __m512 sv1 = load_group_scales<GROUP_SIZE>(s1, g);
+          const __m512 sv2 = load_group_scales<GROUP_SIZE>(s2, g);
+          const __m512 sv3 = load_group_scales<GROUP_SIZE>(s3, g);
 
 #define V_FMA_ROW(M_I)                                                      \
   do {                                                                      \
@@ -270,22 +316,23 @@ struct GemmKernel224MXFP4SmallKGroup {
         }
         for (int i = 0; i < MB; i++) {
           float* c_row = bc->get_submat(m, n, m_pos + i, n_start);
-          reduce4(acc[i][0], acc[i][1], acc[i][2], acc[i][3], c_row + (n_pos - n_start));
+          reduce4<GROUP_SIZE>(acc[i][0], acc[i][1], acc[i][2], acc[i][3], c_row + (n_pos - n_start), bb);
         }
       }
       // N 尾巴: 单 N 列 × MB token (V4 不触发)
       for (; n_pos < n_end; n_pos++) {
         __m128i* w = (__m128i*)bb->get_submat(n, k, n_pos, 0);
-        const float* s = bb->get_scale(n, n_pos, k, 0);
+        const void* s = GROUP_SIZE == 16 ? static_cast<const void*>(bb->get_native_scale(n, n_pos, k, 0))
+                                         : static_cast<const void*>(bb->get_scale(n, n_pos, k, 0));
         for (int i = 0; i < MB; i++) {
           float* c_row = bc->get_submat(m, n, m_pos + i, n_start);
           __m512 acc = _mm512_setzero_ps();
           for (int g = 0; g < kg_count; g++) {
             const ActivationBF16 a(a_rows[i][g]);
             const DequantizedWeight d(w[g]);
-            acc = _mm512_fmadd_ps(_mm512_set1_ps(s[g]), mxfp4_dot_bf16(d, a), acc);
+            acc = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s, g), mxfp4_dot_bf16(d, a), acc);
           }
-          c_row[n_pos - n_start] = _mm512_reduce_add_ps(acc);
+          c_row[n_pos - n_start] = finalize<GROUP_SIZE>(_mm512_reduce_add_ps(acc), bb);
         }
       }
     }
@@ -299,10 +346,14 @@ struct GemmKernel224MXFP4SmallKGroup {
         __m128i* w1 = (__m128i*)bb->get_submat(n, k, n_pos + 1, 0);
         __m128i* w2 = (__m128i*)bb->get_submat(n, k, n_pos + 2, 0);
         __m128i* w3 = (__m128i*)bb->get_submat(n, k, n_pos + 3, 0);
-        const float* s0 = bb->get_scale(n, n_pos + 0, k, 0);
-        const float* s1 = bb->get_scale(n, n_pos + 1, k, 0);
-        const float* s2 = bb->get_scale(n, n_pos + 2, k, 0);
-        const float* s3 = bb->get_scale(n, n_pos + 3, k, 0);
+        const void* s0 = GROUP_SIZE == 16 ? static_cast<const void*>(bb->get_native_scale(n, n_pos + 0, k, 0))
+                                          : static_cast<const void*>(bb->get_scale(n, n_pos + 0, k, 0));
+        const void* s1 = GROUP_SIZE == 16 ? static_cast<const void*>(bb->get_native_scale(n, n_pos + 1, k, 0))
+                                          : static_cast<const void*>(bb->get_scale(n, n_pos + 1, k, 0));
+        const void* s2 = GROUP_SIZE == 16 ? static_cast<const void*>(bb->get_native_scale(n, n_pos + 2, k, 0))
+                                          : static_cast<const void*>(bb->get_scale(n, n_pos + 2, k, 0));
+        const void* s3 = GROUP_SIZE == 16 ? static_cast<const void*>(bb->get_native_scale(n, n_pos + 3, k, 0))
+                                          : static_cast<const void*>(bb->get_scale(n, n_pos + 3, k, 0));
         __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps(), a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
         for (int g = 0; g < kg_count; g++) {
           const ActivationBF16 a(a_row[g]);
@@ -310,24 +361,36 @@ struct GemmKernel224MXFP4SmallKGroup {
           const DequantizedWeight d1(w1[g]);
           const DequantizedWeight d2(w2[g]);
           const DequantizedWeight d3(w3[g]);
-          a0 = _mm512_fmadd_ps(_mm512_set1_ps(s0[g]), mxfp4_dot_bf16(d0, a), a0);
-          a1 = _mm512_fmadd_ps(_mm512_set1_ps(s1[g]), mxfp4_dot_bf16(d1, a), a1);
-          a2 = _mm512_fmadd_ps(_mm512_set1_ps(s2[g]), mxfp4_dot_bf16(d2, a), a2);
-          a3 = _mm512_fmadd_ps(_mm512_set1_ps(s3[g]), mxfp4_dot_bf16(d3, a), a3);
+          a0 = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s0, g), mxfp4_dot_bf16(d0, a), a0);
+          a1 = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s1, g), mxfp4_dot_bf16(d1, a), a1);
+          a2 = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s2, g), mxfp4_dot_bf16(d2, a), a2);
+          a3 = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s3, g), mxfp4_dot_bf16(d3, a), a3);
         }
-        reduce4(a0, a1, a2, a3, c_row + (n_pos - n_start));
+        reduce4<GROUP_SIZE>(a0, a1, a2, a3, c_row + (n_pos - n_start), bb);
       }
       for (; n_pos < n_end; n_pos++) {
         __m128i* w = (__m128i*)bb->get_submat(n, k, n_pos, 0);
-        const float* s = bb->get_scale(n, n_pos, k, 0);
+        const void* s = GROUP_SIZE == 16 ? static_cast<const void*>(bb->get_native_scale(n, n_pos, k, 0))
+                                         : static_cast<const void*>(bb->get_scale(n, n_pos, k, 0));
         __m512 acc = _mm512_setzero_ps();
         for (int g = 0; g < kg_count; g++) {
           const ActivationBF16 a(a_row[g]);
           const DequantizedWeight d(w[g]);
-          acc = _mm512_fmadd_ps(_mm512_set1_ps(s[g]), mxfp4_dot_bf16(d, a), acc);
+          acc = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s, g), mxfp4_dot_bf16(d, a), acc);
         }
-        c_row[n_pos - n_start] = _mm512_reduce_add_ps(acc);
+        c_row[n_pos - n_start] = finalize<GROUP_SIZE>(_mm512_reduce_add_ps(acc), bb);
       }
+    }
+  }
+
+  static void fp4_mat_mat_kgroup(int m, int n, int k, int k_group_size, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
+                                 int nth) {
+    if (k_group_size == 16) {
+      fp4_mat_mat_kgroup_impl<16>(m, n, k, ba, bb, bc, ith, nth);
+    } else if (k_group_size == 32) {
+      fp4_mat_mat_kgroup_impl<32>(m, n, k, ba, bb, bc, ith, nth);
+    } else {
+      throw std::runtime_error("FP4 AMX supports only group sizes 16 and 32");
     }
   }
 };
@@ -378,6 +441,9 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     auto& quant_config = config_.quant_config;
     if (quant_config.group_size == 0 || quant_config.zero_point) {
       throw std::runtime_error("MXFP4 MoE only supports KGroup FP4");
+    }
+    if ((quant_config.group_size == 16) != (quant_config.quant_method == "NVFP4")) {
+      throw std::runtime_error("AMX FP4 group_size=16 is reserved for native ModelOpt NVFP4");
     }
     printf("Creating AMX_FP4_MOE_TP %d at numa %d\n", tp_part_idx, numa_node_of_cpu(sched_getcpu()));
   }
@@ -683,12 +749,109 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
   using Base = TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K>>>;
   using Base::Base;
 
+  void load_nvfp4_weights() {
+    auto& config = this->config;
+    auto& tps = this->tps;
+    auto pool = config.pool;
+    const uint64_t* physical_to_logical_map = (const uint64_t*)config.physical_to_logical_map;
+
+    if (config.quant_config.group_size != 16) {
+      throw std::runtime_error("ModelOpt NVFP4 requires group_size=16");
+    }
+    if (config.hidden_size % 32 != 0 || config.intermediate_size % this->tp_count != 0 ||
+        (config.intermediate_size / this->tp_count) % 32 != 0) {
+      throw std::runtime_error("ModelOpt NVFP4 requires every NUMA partition dimension to be divisible by 32");
+    }
+    if (config.gate_projs.empty() || config.up_projs.empty() || config.down_projs.empty() ||
+        config.gate_scales.empty() || config.up_scales.empty() || config.down_scales.empty() ||
+        config.gate_scale2s.empty() || config.up_scale2s.empty() || config.down_scale2s.empty()) {
+      throw std::runtime_error("ModelOpt NVFP4 requires per-expert weight, block-scale, and tensor-scale pointers");
+    }
+
+    const int full_intermediate = config.intermediate_size;
+    (void)e4m3fn_lut();
+    pool->dispense_backend()->do_numa_job([&, this](int numa_id) {
+      auto* tp = tps[numa_id].get();
+      auto& tpc = tp->config_;
+      const int local_intermediate = tpc.intermediate_size;
+      const int hidden_groups = tpc.hidden_size / 16;
+      const int local_intermediate_groups = local_intermediate / 16;
+      const int full_intermediate_groups = full_intermediate / 16;
+      auto subpool = pool->get_subpool(numa_id);
+
+      subpool->do_work_stealing_job(
+          tpc.expert_num, nullptr,
+          [&, numa_id, local_intermediate, hidden_groups, local_intermediate_groups,
+           full_intermediate_groups](int expert_id) {
+            if (tpc.should_skip_expert(expert_id)) return;
+            const uint64_t logical_id = expert_map(physical_to_logical_map, expert_id);
+            if (logical_id >= config.gate_projs[0].size() || logical_id >= config.up_projs[0].size() ||
+                logical_id >= config.down_projs[0].size() || logical_id >= config.gate_scales[0].size() ||
+                logical_id >= config.up_scales[0].size() || logical_id >= config.down_scales[0].size() ||
+                logical_id >= config.gate_scale2s[0].size() || logical_id >= config.up_scale2s[0].size() ||
+                logical_id >= config.down_scale2s[0].size()) {
+              throw std::runtime_error("NVFP4 logical expert id is outside the source pointer tables");
+            }
+            if (config.gate_projs[0][logical_id] == nullptr || config.up_projs[0][logical_id] == nullptr ||
+                config.down_projs[0][logical_id] == nullptr || config.gate_scales[0][logical_id] == nullptr ||
+                config.up_scales[0][logical_id] == nullptr || config.down_scales[0][logical_id] == nullptr ||
+                config.gate_scale2s[0][logical_id] == nullptr || config.up_scale2s[0][logical_id] == nullptr ||
+                config.down_scale2s[0][logical_id] == nullptr) {
+              throw std::runtime_error("NVFP4 source pointer table contains a null entry");
+            }
+
+            const size_t gate_weight_bytes = (size_t)local_intermediate * tpc.hidden_size / 2;
+            const size_t gate_weight_offset = (size_t)numa_id * gate_weight_bytes;
+            tp->gate_bb_[expert_id]->from_raw_mat(
+                (const uint8_t*)config.gate_projs[0][logical_id] + gate_weight_offset, 0, 1);
+            tp->up_bb_[expert_id]->from_raw_mat(
+                (const uint8_t*)config.up_projs[0][logical_id] + gate_weight_offset, 0, 1);
+
+            const size_t gate_scale_count = (size_t)local_intermediate * hidden_groups;
+            const size_t gate_scale_offset = (size_t)numa_id * gate_scale_count;
+            std::memcpy(reinterpret_cast<uint8_t*>(tp->gate_bb_[expert_id]->d),
+                        (const uint8_t*)config.gate_scales[0][logical_id] + gate_scale_offset, gate_scale_count);
+            std::memcpy(reinterpret_cast<uint8_t*>(tp->up_bb_[expert_id]->d),
+                        (const uint8_t*)config.up_scales[0][logical_id] + gate_scale_offset, gate_scale_count);
+            tp->gate_bb_[expert_id]->tensor_scale = *(const float*)config.gate_scale2s[0][logical_id];
+            tp->up_bb_[expert_id]->tensor_scale = *(const float*)config.up_scale2s[0][logical_id];
+
+            const uint8_t* down_weight = (const uint8_t*)config.down_projs[0][logical_id];
+            const uint8_t* down_scale = (const uint8_t*)config.down_scales[0][logical_id];
+            uint8_t* down_weight_dst = (uint8_t*)tp->down_bb_[expert_id]->b;
+            uint8_t* down_scale_dst = reinterpret_cast<uint8_t*>(tp->down_bb_[expert_id]->d);
+            const size_t local_down_row_bytes = (size_t)local_intermediate / 2;
+            const size_t full_down_row_bytes = (size_t)full_intermediate / 2;
+            for (int row = 0; row < tpc.hidden_size; ++row) {
+              std::memcpy(
+                  down_weight_dst + (size_t)row * local_down_row_bytes,
+                  down_weight + (size_t)row * full_down_row_bytes +
+                      (size_t)numa_id * local_down_row_bytes,
+                  local_down_row_bytes);
+              std::memcpy(down_scale_dst + (size_t)row * local_intermediate_groups,
+                          down_scale + (size_t)row * full_intermediate_groups +
+                              (size_t)numa_id * local_intermediate_groups,
+                          local_intermediate_groups);
+            }
+            tp->down_bb_[expert_id]->tensor_scale = *(const float*)config.down_scale2s[0][logical_id];
+          },
+          nullptr);
+    });
+
+    this->weights_loaded = true;
+  }
+
   void load_weights() override {
     auto& config = this->config;
     auto& tps = this->tps;
     auto& tp_count = this->tp_count;
     auto pool = config.pool;
     const uint64_t* physical_to_logical_map = (const uint64_t*)config.physical_to_logical_map;
+
+    if (config.quant_config.quant_method == "NVFP4") {
+      load_nvfp4_weights();
+      return;
+    }
 
     bool use_per_expert_ptrs = !config.gate_projs.empty();
 
@@ -810,6 +973,8 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
                                     const std::vector<uintptr_t>& w13_scale_ptrs,
                                     const std::vector<uintptr_t>& w2_weight_ptrs,
                                     const std::vector<uintptr_t>& w2_scale_ptrs) {
+    if (this->config.quant_config.quant_method == "NVFP4")
+      throw std::runtime_error("Native NVFP4 supports static CPU/GPU expert placement only");
     if (!this->weights_loaded) throw std::runtime_error("Not Loaded");
     if (this->tps.empty()) throw std::runtime_error("No TP parts initialized");
     if (w13_weight_ptrs.size() != gpu_tp_count || w13_scale_ptrs.size() != gpu_tp_count ||

@@ -1082,7 +1082,8 @@ template <typename K>
 struct BufferBInt4KGroupImpl {
   using dt = typename K::dt;
   dt* b;     // packed signed int4 weights, col majored
-  float* d;  // scales only (no mins/zero-points), row majored
+  float* d;  // FP32 scales, or native E4M3 bytes when k_group_size == 16
+  float tensor_scale = 1.0f;
   int n, k, k_group_size, k_group_count;
 
   static constexpr int N_STEP = K::N_STEP;
@@ -1091,7 +1092,10 @@ struct BufferBInt4KGroupImpl {
 
   // Size calculation: packed int4 weights + scales (NO mins)
   static size_t required_size(int n, int k, int k_group_size) {
-    return sizeof(int8_t) * n * k / 2 + sizeof(float) * n * (k / k_group_size);
+    const size_t weight_bytes = sizeof(int8_t) * (size_t)n * k / 2;
+    const size_t scale_count = (size_t)n * (k / k_group_size);
+    const size_t scale_bytes = scale_count * (k_group_size == 16 ? sizeof(uint8_t) : sizeof(float));
+    return (weight_bytes + scale_bytes + 63) & ~size_t{63};
   }
 
   BufferBInt4KGroupImpl(int n, int k, int k_group_size, void* ptr) : n(n), k(k), k_group_size(k_group_size) {
@@ -1111,7 +1115,7 @@ struct BufferBInt4KGroupImpl {
   // Load from packed signed int4 format
   // Input: proj is packed int4 weights (2 int4 values per byte)
   // Each int4 value is in range [-8, 7] (signed)
-  void from_raw_mat(uint8_t* proj, int ith, int nth) {
+  void from_raw_mat(const uint8_t* proj, int ith, int nth) {
     auto [n_start, n_end] = K::split_range_n(n, ith, nth);
     if (n_start >= n_end) {
       return;
@@ -1135,6 +1139,16 @@ struct BufferBInt4KGroupImpl {
   float* get_scale(int n, int n_begin, int k, int k_begin) {
     int k_group_idx = k_begin / k_group_size;
     return d + n_begin * (k / k_group_size) + k_group_idx;
+  }
+
+  uint8_t* get_native_scale(int n, int n_begin, int k, int k_begin) {
+    int k_group_idx = k_begin / k_group_size;
+    return reinterpret_cast<uint8_t*>(d) + n_begin * (k / k_group_size) + k_group_idx;
+  }
+
+  const uint8_t* get_native_scale(int n, int n_begin, int k, int k_begin) const {
+    int k_group_idx = k_begin / k_group_size;
+    return reinterpret_cast<const uint8_t*>(d) + n_begin * (k / k_group_size) + k_group_idx;
   }
 
   // Split range for parallel processing
