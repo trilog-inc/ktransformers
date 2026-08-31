@@ -125,7 +125,7 @@ python -m sglang.launch_server \
   --attention-backend nsa \
   --nsa-prefill-backend flashinfer_sparse_mla \
   --nsa-decode-backend flashinfer_sparse_mla \
-  --kv-cache-dtype bfloat16 \
+  --kv-cache-dtype fp8_e4m3 \
   --trust-remote-code \
   --disable-shared-experts-fusion \
   --mem-fraction-static 0.95 \
@@ -142,11 +142,12 @@ Native NVFP4 currently requires static expert residency. Do not add
 `--kt-enable-dynamic-expert-update`, and keep
 `--kt-gpu-prefill-token-threshold 0`.
 
-Use BF16 KV cache as the correctness baseline. Only switch to
-`--kv-cache-dtype fp8_e4m3` after comparing deterministic outputs against the
-BF16 run. If startup reports that no FP8 KV scaling factors were provided and
-defaults them to `1.0`, the comparison is especially important because errors
-can accumulate across decode tokens.
+Keep `--kv-cache-dtype fp8_e4m3` with the SM120 FlashInfer sparse MLA backend.
+This path dynamically quantizes each 128-element latent block and stores its
+FP32 scale inline in the 656-byte token layout. The generic startup warning
+about missing checkpoint-level KV scales does not mean that this packed cache
+is using an unscaled raw FP8 cast. The SM120 FlashInfer kernel does not accept
+BF16 KV-cache storage.
 
 The SM120 sparse MLA path requires a FlashInfer build that provides
 `flashinfer_sparse_mla` support for the installed CUDA and PyTorch versions.
