@@ -110,6 +110,7 @@ export SGLANG_ENABLE_JIT_DEEPGEMM=0
 CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
 python -m sglang.launch_server \
   --model-path "$MODEL_PATH" \
+  --quantization modelopt_fp4 \
   --kt-weight-path "$MODEL_PATH" \
   --kt-method NVFP4 \
   --kt-cpuinfer "$KT_CPU_THREADS" \
