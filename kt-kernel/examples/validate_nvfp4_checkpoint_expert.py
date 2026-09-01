@@ -64,6 +64,15 @@ def parse_args() -> argparse.Namespace:
             "working set instead of repeatedly hitting one expert in LLC."
         ),
     )
+    parser.add_argument(
+        "--benchmark-top-k",
+        type=int,
+        default=1,
+        help=(
+            "Route this many experts in each timed forward. The expert count "
+            "must be divisible by top-k so timing can rotate disjoint banks."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -84,6 +93,12 @@ def make_cpu_infer(threads: int, numa_nodes: list[int]):
 def load_checkpoint_experts(args: argparse.Namespace):
     if args.benchmark_expert_count < 1:
         raise ValueError("--benchmark-expert-count must be at least 1")
+    if args.benchmark_top_k < 1:
+        raise ValueError("--benchmark-top-k must be at least 1")
+    if args.benchmark_expert_count % args.benchmark_top_k:
+        raise ValueError(
+            "--benchmark-expert-count must be divisible by --benchmark-top-k"
+        )
     expert_ids = list(
         range(args.expert, args.expert + args.benchmark_expert_count)
     )
@@ -152,7 +167,7 @@ def build_native_moe(
     expert_count = len(weight_bank)
     config = kt_kernel_ext.moe.MOEConfig(
         expert_count,
-        1,
+        args.benchmark_top_k,
         args.hidden_size,
         args.intermediate_size,
         0,
@@ -199,15 +214,18 @@ def build_native_moe(
     return moe, physical_to_logical
 
 
-def native_forward(moe, cpu_infer, inputs: torch.Tensor) -> torch.Tensor:
+def native_forward(
+    moe, cpu_infer, inputs: torch.Tensor, top_k: int
+) -> torch.Tensor:
     output = torch.empty_like(inputs)
     batch_size = torch.ones(1, dtype=torch.int32)
-    expert_ids = torch.zeros((1, 1), dtype=torch.int64)
-    routing_weights = torch.ones((1, 1), dtype=torch.float32)
+    expert_ids = torch.arange(top_k, dtype=torch.int64).view(1, top_k)
+    routing_weights = torch.zeros((1, top_k), dtype=torch.float32)
+    routing_weights[0, 0] = 1.0
     cpu_infer.submit(
         moe.forward_task(
             batch_size.data_ptr(),
-            1,
+            top_k,
             expert_ids.data_ptr(),
             routing_weights.data_ptr(),
             inputs.data_ptr(),
@@ -228,6 +246,7 @@ def benchmark_native_forward(
     hidden_size: int,
     intermediate_size: int,
     expert_count: int,
+    top_k: int,
 ) -> None:
     if iterations <= 0:
         return
@@ -235,17 +254,20 @@ def benchmark_native_forward(
     output = torch.empty_like(inputs)
     batch_size = torch.ones(1, dtype=torch.int32)
     expert_ids = [
-        torch.full((1, 1), expert_id, dtype=torch.int64)
-        for expert_id in range(expert_count)
+        torch.arange(start, start + top_k, dtype=torch.int64).view(1, top_k)
+        for start in range(0, expert_count, top_k)
     ]
-    routing_weights = torch.ones((1, 1), dtype=torch.float32)
+    routing_weights = torch.full(
+        (1, top_k), 1.0 / top_k, dtype=torch.float32
+    )
+    route_count = len(expert_ids)
 
     def run_once(expert_index: int) -> None:
         cpu_infer.submit(
             moe.forward_task(
                 batch_size.data_ptr(),
-                1,
-                expert_ids[expert_index].data_ptr(),
+                top_k,
+                expert_ids[expert_index % route_count].data_ptr(),
                 routing_weights.data_ptr(),
                 inputs.data_ptr(),
                 output.data_ptr(),
@@ -254,23 +276,23 @@ def benchmark_native_forward(
         )
         cpu_infer.sync()
 
-    warmup_runs = max(max(warmup, 0), expert_count)
+    warmup_runs = max(max(warmup, 0), route_count)
     for iteration in range(warmup_runs):
-        run_once(iteration % expert_count)
+        run_once(iteration)
 
     started = time.perf_counter()
     for iteration in range(iterations):
-        run_once(iteration % expert_count)
+        run_once(iteration)
     elapsed = time.perf_counter() - started
 
     seconds_per_forward = elapsed / iterations
     projection_elements = 3 * hidden_size * intermediate_size
     checkpoint_bytes = projection_elements * (0.5 + 1.0 / 16.0)
-    effective_gbps = checkpoint_bytes / seconds_per_forward / 1e9
+    effective_gbps = checkpoint_bytes * top_k / seconds_per_forward / 1e9
     benchmark_kind = "LLC-hot" if expert_count == 1 else "rotating"
     working_set_gb = checkpoint_bytes * expert_count / 1e9
     print(
-        f"  benchmark ({benchmark_kind}, experts={expert_count}, "
+        f"  benchmark ({benchmark_kind}, experts={expert_count}, top_k={top_k}, "
         f"weight_working_set={working_set_gb:.3f} GB): "
         f"{seconds_per_forward * 1e3:.3f} ms/forward "
         f"{1.0 / seconds_per_forward:.3f} forwards/s "
@@ -324,7 +346,9 @@ def main() -> None:
         moe, physical_to_logical = build_native_moe(
             backend, cpu_infer, weight_bank, args
         )
-        actual = native_forward(moe, cpu_infer, inputs)
+        actual = native_forward(
+            moe, cpu_infer, inputs, args.benchmark_top_k
+        )
         difference = (actual.float() - expected.float()).abs()
         relative_error = difference.mean().item() / (expected_mean + 1e-12)
         passed = bool(torch.isfinite(actual.float()).all()) and (
@@ -347,6 +371,7 @@ def main() -> None:
             args.hidden_size,
             args.intermediate_size,
             len(weight_bank),
+            args.benchmark_top_k,
         )
         del moe, physical_to_logical, cpu_infer, actual
         gc.collect()
