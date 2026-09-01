@@ -67,7 +67,9 @@ inline int nvfp4_n_block() {
 #if defined(__AVX512BF16__)
   static const int block = [] {
     const char* value = std::getenv("KT_NVFP4_N_BLOCK");
-    return value != nullptr && std::strcmp(value, "128") == 0 ? 128 : 256;
+    if (value == nullptr || *value == '\0') return 256;
+    const int parsed = std::atoi(value);
+    return parsed >= 64 && parsed <= 256 && parsed % 32 == 0 ? parsed : 256;
   }();
   return block;
 #else
