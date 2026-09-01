@@ -177,12 +177,17 @@ python kt-kernel/examples/validate_nvfp4_checkpoint_expert.py \
   --layer 3 \
   --expert 31 \
   --threads "$KT_CPU_THREADS" \
-  --numa-nodes 0 1
+  --numa-nodes 0 1 \
+  --benchmark-warmup 5 \
+  --benchmark-iterations 30
 ```
 
 Both backends should report `status=PASS`. If only
 `AMXFP4_KGroup_MOE` fails, relaunch temporarily with
 `KT_MXFP4_BACKEND=avx2` to isolate the AVX512 implementation.
+The benchmark line reports complete gate, up, activation, and down latency for
+one routed expert. `effective_weight_GB/s` counts the native packed weights and
+E4M3 block scales read by those three projections.
 
 For performance measurement, warm the server first and compare prompt and
 decode throughput separately. Record `KT_GPU_EXPERTS`, CPU affinity, NUMA
