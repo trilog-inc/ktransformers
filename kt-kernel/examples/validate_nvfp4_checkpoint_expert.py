@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import statistics
 import time
 from pathlib import Path
 
@@ -54,6 +55,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--relative-tolerance", type=float, default=0.08)
     parser.add_argument("--benchmark-iterations", type=int, default=0)
     parser.add_argument("--benchmark-warmup", type=int, default=3)
+    parser.add_argument(
+        "--benchmark-repeats",
+        type=int,
+        default=1,
+        help="Repeat the timed region and report median performance.",
+    )
     parser.add_argument(
         "--benchmark-expert-count",
         type=int,
@@ -247,9 +254,12 @@ def benchmark_native_forward(
     intermediate_size: int,
     expert_count: int,
     top_k: int,
+    repeats: int,
 ) -> None:
     if iterations <= 0:
         return
+    if repeats < 1:
+        raise ValueError("--benchmark-repeats must be at least 1")
 
     output = torch.empty_like(inputs)
     batch_size = torch.ones(1, dtype=torch.int32)
@@ -280,12 +290,15 @@ def benchmark_native_forward(
     for iteration in range(warmup_runs):
         run_once(iteration)
 
-    started = time.perf_counter()
-    for iteration in range(iterations):
-        run_once(iteration)
-    elapsed = time.perf_counter() - started
+    samples = []
+    for repeat in range(repeats):
+        started = time.perf_counter()
+        for iteration in range(iterations):
+            run_once(repeat * iterations + iteration)
+        elapsed = time.perf_counter() - started
+        samples.append(elapsed / iterations)
 
-    seconds_per_forward = elapsed / iterations
+    seconds_per_forward = statistics.median(samples)
     projection_elements = 3 * hidden_size * intermediate_size
     checkpoint_bytes = projection_elements * (0.5 + 1.0 / 16.0)
     effective_gbps = checkpoint_bytes * top_k / seconds_per_forward / 1e9
@@ -298,6 +311,10 @@ def benchmark_native_forward(
         f"{1.0 / seconds_per_forward:.3f} forwards/s "
         f"{effective_gbps:.3f} effective_weight_GB/s"
     )
+    if repeats > 1:
+        sample_ms = ", ".join(f"{sample * 1e3:.3f}" for sample in samples)
+        spread = (max(samples) - min(samples)) / seconds_per_forward * 100.0
+        print(f"    samples_ms=[{sample_ms}] spread={spread:.2f}%")
 
 
 def selected_backends(name: str):
@@ -372,6 +389,7 @@ def main() -> None:
             args.intermediate_size,
             len(weight_bank),
             args.benchmark_top_k,
+            args.benchmark_repeats,
         )
         del moe, physical_to_logical, cpu_infer, actual
         gc.collect()
