@@ -43,46 +43,31 @@ struct GemmKernel224MXFP4SmallKGroup {
   }
   static void config() {}
 
-  // FP4 E2M1 → BF16 LUTs (16 entries each, for PSHUFB within 128-bit lanes)
+  // FP4 E2M1 → BF16 lookup table. The second half is duplicated because
+  // VPERMW indexes all 32 lanes of a ZMM register.
   // E2M1 values: {0, ±0.5, ±1.0, ±1.5, ±2.0, ±3.0, ±4.0, ±6.0}
-  alignas(16) static constexpr uint8_t fp4_bf16_lo[16] = {
-      0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0,   //  0..7  positive
-      0x00, 0x00, 0x80, 0xC0, 0x00, 0x40, 0x80, 0xC0};  //  8..15 negative
-  alignas(16) static constexpr uint8_t fp4_bf16_hi[16] = {
-      0x00, 0x3F, 0x3F, 0x3F, 0x40, 0x40, 0x40, 0x40,   //  0..7  positive
-      0x80, 0xBF, 0xBF, 0xBF, 0xC0, 0xC0, 0xC0, 0xC0};  //  8..15 negative
+  alignas(64) static constexpr uint16_t fp4_bf16[32] = {
+      0x0000, 0x3F00, 0x3F80, 0x3FC0, 0x4000, 0x4040, 0x4080, 0x40C0,
+      0x8000, 0xBF00, 0xBF80, 0xBFC0, 0xC000, 0xC040, 0xC080, 0xC0C0,
+      0x0000, 0x3F00, 0x3F80, 0x3FC0, 0x4000, 0x4040, 0x4080, 0x40C0,
+      0x8000, 0xBF00, 0xBF80, 0xBFC0, 0xC000, 0xC040, 0xC080, 0xC0C0};
 
   // Convert 16 packed FP4 bytes (32 values = 1 k_group) → 32 BF16 values (__m512i)
   // Output column order: [BF16(lo[0]),BF16(hi[0]), ..., BF16(lo[15]),BF16(hi[15])]
   __attribute__((always_inline)) static inline __m512i mxfp4_to_bf16_32(__m128i packed) {
-    __m128i lo_mask = _mm_set1_epi8(0x0F);
-    __m128i lo = _mm_and_si128(packed, lo_mask);
-    __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), lo_mask);
+    const __m128i lo_mask = _mm_set1_epi8(0x0F);
+    const __m128i lo = _mm_and_si128(packed, lo_mask);
+    const __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), lo_mask);
 
-    __m128i lut_lo = _mm_load_si128((__m128i*)fp4_bf16_lo);
-    __m128i lut_hi = _mm_load_si128((__m128i*)fp4_bf16_hi);
-
-    // Look up low/high bytes for lo nibbles → 16 BF16 values
-    __m128i l_lo = _mm_shuffle_epi8(lut_lo, lo);
-    __m128i l_hi = _mm_shuffle_epi8(lut_hi, lo);
-    __m128i lo_bf16_0 = _mm_unpacklo_epi8(l_lo, l_hi);  // BF16(lo[0..7])
-    __m128i lo_bf16_1 = _mm_unpackhi_epi8(l_lo, l_hi);  // BF16(lo[8..15])
-
-    // Look up low/high bytes for hi nibbles → 16 BF16 values
-    __m128i h_lo = _mm_shuffle_epi8(lut_lo, hi);
-    __m128i h_hi = _mm_shuffle_epi8(lut_hi, hi);
-    __m128i hi_bf16_0 = _mm_unpacklo_epi8(h_lo, h_hi);  // BF16(hi[0..7])
-    __m128i hi_bf16_1 = _mm_unpackhi_epi8(h_lo, h_hi);  // BF16(hi[8..15])
-
-    // Interleave lo/hi at 16-bit: [lo[0],hi[0], lo[1],hi[1], ...] = column order
-    __m128i p0 = _mm_unpacklo_epi16(lo_bf16_0, hi_bf16_0);  // cols  0..7
-    __m128i p1 = _mm_unpackhi_epi16(lo_bf16_0, hi_bf16_0);  // cols  8..15
-    __m128i p2 = _mm_unpacklo_epi16(lo_bf16_1, hi_bf16_1);  // cols 16..23
-    __m128i p3 = _mm_unpackhi_epi16(lo_bf16_1, hi_bf16_1);  // cols 24..31
-
-    __m256i q0 = _mm256_inserti128_si256(_mm256_castsi128_si256(p0), p1, 1);
-    __m256i q1 = _mm256_inserti128_si256(_mm256_castsi128_si256(p2), p3, 1);
-    return _mm512_inserti64x4(_mm512_castsi256_si512(q0), q1, 1);
+    // Build the 32 nibble indexes in matrix-column order, widen them, then
+    // perform the complete E2M1-to-BF16 conversion with one VPERMW.
+    const __m128i idx_lo = _mm_unpacklo_epi8(lo, hi);
+    const __m128i idx_hi = _mm_unpackhi_epi8(lo, hi);
+    const __m256i idx8 =
+        _mm256_inserti128_si256(_mm256_castsi128_si256(idx_lo), idx_hi, 1);
+    const __m512i idx16 = _mm512_cvtepu8_epi16(idx8);
+    const __m512i lut = _mm512_load_si512(fp4_bf16);
+    return _mm512_permutexvar_epi16(idx16, lut);
   }
 
   struct ActivationBF16 {

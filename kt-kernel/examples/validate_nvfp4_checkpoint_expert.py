@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import time
 from pathlib import Path
 
 import torch
@@ -51,6 +52,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--relative-tolerance", type=float, default=0.08)
+    parser.add_argument("--benchmark-iterations", type=int, default=0)
+    parser.add_argument("--benchmark-warmup", type=int, default=3)
     return parser.parse_args()
 
 
@@ -186,6 +189,56 @@ def native_forward(moe, cpu_infer, inputs: torch.Tensor) -> torch.Tensor:
     return output
 
 
+def benchmark_native_forward(
+    moe,
+    cpu_infer,
+    inputs: torch.Tensor,
+    iterations: int,
+    warmup: int,
+    hidden_size: int,
+    intermediate_size: int,
+) -> None:
+    if iterations <= 0:
+        return
+
+    output = torch.empty_like(inputs)
+    batch_size = torch.ones(1, dtype=torch.int32)
+    expert_ids = torch.zeros((1, 1), dtype=torch.int64)
+    routing_weights = torch.ones((1, 1), dtype=torch.float32)
+
+    def run_once() -> None:
+        cpu_infer.submit(
+            moe.forward_task(
+                batch_size.data_ptr(),
+                1,
+                expert_ids.data_ptr(),
+                routing_weights.data_ptr(),
+                inputs.data_ptr(),
+                output.data_ptr(),
+                False,
+            )
+        )
+        cpu_infer.sync()
+
+    for _ in range(max(warmup, 0)):
+        run_once()
+
+    started = time.perf_counter()
+    for _ in range(iterations):
+        run_once()
+    elapsed = time.perf_counter() - started
+
+    seconds_per_forward = elapsed / iterations
+    projection_elements = 3 * hidden_size * intermediate_size
+    checkpoint_bytes = projection_elements * (0.5 + 1.0 / 16.0)
+    effective_gbps = checkpoint_bytes / seconds_per_forward / 1e9
+    print(
+        f"  benchmark: {seconds_per_forward * 1e3:.3f} ms/forward "
+        f"{1.0 / seconds_per_forward:.3f} forwards/s "
+        f"{effective_gbps:.3f} effective_weight_GB/s"
+    )
+
+
 def selected_backends(name: str):
     requested = {
         "amx": ("AMXFP4_KGroup_MOE",),
@@ -243,6 +296,15 @@ def main() -> None:
         )
         print("  expected[:8]", expected[0, :8].float().tolist())
         print("  actual[:8]  ", actual[0, :8].float().tolist())
+        benchmark_native_forward(
+            moe,
+            cpu_infer,
+            inputs,
+            args.benchmark_iterations,
+            args.benchmark_warmup,
+            args.hidden_size,
+            args.intermediate_size,
+        )
         del moe, physical_to_logical, cpu_infer, actual
         gc.collect()
         if not passed:
