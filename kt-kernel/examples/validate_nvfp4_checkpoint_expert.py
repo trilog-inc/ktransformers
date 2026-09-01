@@ -54,6 +54,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--relative-tolerance", type=float, default=0.08)
     parser.add_argument("--benchmark-iterations", type=int, default=0)
     parser.add_argument("--benchmark-warmup", type=int, default=3)
+    parser.add_argument(
+        "--benchmark-expert-count",
+        type=int,
+        default=1,
+        help=(
+            "Load this many consecutive experts starting at --expert and rotate "
+            "them during timing. Values larger than one measure a streaming "
+            "working set instead of repeatedly hitting one expert in LLC."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -71,15 +81,20 @@ def make_cpu_infer(threads: int, numa_nodes: list[int]):
     return kt_kernel_ext.CPUInfer(config)
 
 
-def load_checkpoint_expert(args: argparse.Namespace):
+def load_checkpoint_experts(args: argparse.Namespace):
+    if args.benchmark_expert_count < 1:
+        raise ValueError("--benchmark-expert-count must be at least 1")
+    expert_ids = list(
+        range(args.expert, args.expert + args.benchmark_expert_count)
+    )
     loader = NVFP4SafeTensorLoader(str(args.model_path))
     weights = loader.load_experts(
-        f"model.layers.{args.layer}", expert_ids=[args.expert]
+        f"model.layers.{args.layer}", expert_ids=expert_ids
     )
-    return {
-        name: values[args.expert]
-        for name, values in weights.items()
-    }
+    return expert_ids, [
+        {name: values[expert_id] for name, values in weights.items()}
+        for expert_id in expert_ids
+    ]
 
 
 def dequantize_projection(
@@ -131,11 +146,12 @@ def reference_forward(
 def build_native_moe(
     backend,
     cpu_infer,
-    weights: dict[str, torch.Tensor],
+    weight_bank: list[dict[str, torch.Tensor]],
     args: argparse.Namespace,
 ):
+    expert_count = len(weight_bank)
     config = kt_kernel_ext.moe.MOEConfig(
-        1,
+        expert_count,
         1,
         args.hidden_size,
         args.intermediate_size,
@@ -150,20 +166,34 @@ def build_native_moe(
     config.quant_config.zero_point = False
 
     for projection in ("gate", "up", "down"):
-        setattr(config, f"{projection}_projs", [[weights[projection].data_ptr()]])
+        setattr(
+            config,
+            f"{projection}_projs",
+            [[weights[projection].data_ptr() for weights in weight_bank]],
+        )
         setattr(
             config,
             f"{projection}_scales",
-            [[weights[f"{projection}_scale"].data_ptr()]],
+            [
+                [
+                    weights[f"{projection}_scale"].data_ptr()
+                    for weights in weight_bank
+                ]
+            ],
         )
         setattr(
             config,
             f"{projection}_scale2s",
-            [[weights[f"{projection}_scale_2"].data_ptr()]],
+            [
+                [
+                    weights[f"{projection}_scale_2"].data_ptr()
+                    for weights in weight_bank
+                ]
+            ],
         )
 
     moe = backend(config)
-    physical_to_logical = torch.zeros(1, dtype=torch.int64)
+    physical_to_logical = torch.arange(expert_count, dtype=torch.int64)
     cpu_infer.submit(moe.load_weights_task(physical_to_logical.data_ptr()))
     cpu_infer.sync()
     return moe, physical_to_logical
@@ -197,21 +227,25 @@ def benchmark_native_forward(
     warmup: int,
     hidden_size: int,
     intermediate_size: int,
+    expert_count: int,
 ) -> None:
     if iterations <= 0:
         return
 
     output = torch.empty_like(inputs)
     batch_size = torch.ones(1, dtype=torch.int32)
-    expert_ids = torch.zeros((1, 1), dtype=torch.int64)
+    expert_ids = [
+        torch.full((1, 1), expert_id, dtype=torch.int64)
+        for expert_id in range(expert_count)
+    ]
     routing_weights = torch.ones((1, 1), dtype=torch.float32)
 
-    def run_once() -> None:
+    def run_once(expert_index: int) -> None:
         cpu_infer.submit(
             moe.forward_task(
                 batch_size.data_ptr(),
                 1,
-                expert_ids.data_ptr(),
+                expert_ids[expert_index].data_ptr(),
                 routing_weights.data_ptr(),
                 inputs.data_ptr(),
                 output.data_ptr(),
@@ -220,20 +254,25 @@ def benchmark_native_forward(
         )
         cpu_infer.sync()
 
-    for _ in range(max(warmup, 0)):
-        run_once()
+    warmup_runs = max(max(warmup, 0), expert_count)
+    for iteration in range(warmup_runs):
+        run_once(iteration % expert_count)
 
     started = time.perf_counter()
-    for _ in range(iterations):
-        run_once()
+    for iteration in range(iterations):
+        run_once(iteration % expert_count)
     elapsed = time.perf_counter() - started
 
     seconds_per_forward = elapsed / iterations
     projection_elements = 3 * hidden_size * intermediate_size
     checkpoint_bytes = projection_elements * (0.5 + 1.0 / 16.0)
     effective_gbps = checkpoint_bytes / seconds_per_forward / 1e9
+    benchmark_kind = "LLC-hot" if expert_count == 1 else "rotating"
+    working_set_gb = checkpoint_bytes * expert_count / 1e9
     print(
-        f"  benchmark: {seconds_per_forward * 1e3:.3f} ms/forward "
+        f"  benchmark ({benchmark_kind}, experts={expert_count}, "
+        f"weight_working_set={working_set_gb:.3f} GB): "
+        f"{seconds_per_forward * 1e3:.3f} ms/forward "
         f"{1.0 / seconds_per_forward:.3f} forwards/s "
         f"{effective_gbps:.3f} effective_weight_GB/s"
     )
@@ -260,9 +299,12 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.set_num_threads(args.threads)
 
-    weights = load_checkpoint_expert(args)
+    benchmark_expert_ids, weight_bank = load_checkpoint_experts(args)
+    weights = weight_bank[0]
     print(
-        f"checkpoint={args.model_path} layer={args.layer} expert={args.expert}"
+        f"checkpoint={args.model_path} layer={args.layer} expert={args.expert} "
+        f"benchmark_experts={benchmark_expert_ids[0]}.."
+        f"{benchmark_expert_ids[-1]}"
     )
     for projection in ("gate", "up", "down"):
         print(
@@ -280,7 +322,7 @@ def main() -> None:
     for backend_name, backend in selected_backends(args.backend):
         cpu_infer = make_cpu_infer(args.threads, args.numa_nodes)
         moe, physical_to_logical = build_native_moe(
-            backend, cpu_infer, weights, args
+            backend, cpu_infer, weight_bank, args
         )
         actual = native_forward(moe, cpu_infer, inputs)
         difference = (actual.float() - expected.float()).abs()
@@ -304,6 +346,7 @@ def main() -> None:
             args.benchmark_warmup,
             args.hidden_size,
             args.intermediate_size,
+            len(weight_bank),
         )
         del moe, physical_to_logical, cpu_infer, actual
         gc.collect()
