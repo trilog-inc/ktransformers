@@ -81,7 +81,10 @@ def _make_projection(experts, rows, columns, seed, tensor_scales):
     )
     packed = ((codes[..., 1::2] << 4) | codes[..., 0::2]).contiguous()
 
-    scale_choices = torch.tensor([0.03125, 0.0625, 0.125, 0.25], dtype=torch.float32)
+    scale_choices = torch.tensor(
+        [0.0, 0.001953125, 0.013671875, 0.015625, 0.0625, 0.25, 0.5, 1.0],
+        dtype=torch.float32,
+    )
     scale_indices = torch.randint(
         0,
         len(scale_choices),

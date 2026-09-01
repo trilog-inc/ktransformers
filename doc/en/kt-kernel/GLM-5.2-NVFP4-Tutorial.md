@@ -189,6 +189,24 @@ The benchmark line reports complete gate, up, activation, and down latency for
 one routed expert. `effective_weight_GB/s` counts the native packed weights and
 E4M3 block scales read by those three projections.
 
+The AVX512-BF16 backend defaults to a decode-oriented 16-output blocked layout
+and prints `layout=blocked-n16` while loading. It retains packed E2M1 weights
+and byte-packed E4M3 scales. To compare against the coherent row-major control
+kernel in a separate process, run:
+
+```bash
+KT_NVFP4_BLOCKED_LAYOUT=0 \
+python kt-kernel/examples/validate_nvfp4_checkpoint_expert.py \
+  "$MODEL_PATH" \
+  --layer 3 \
+  --expert 31 \
+  --threads "$KT_CPU_THREADS" \
+  --numa-nodes 0 1 \
+  --backend amx \
+  --benchmark-warmup 5 \
+  --benchmark-iterations 30
+```
+
 For performance measurement, warm the server first and compare prompt and
 decode throughput separately. Record `KT_GPU_EXPERTS`, CPU affinity, NUMA
 placement, prompt length, concurrency, and whether CUDA graphs were captured.

@@ -9,15 +9,246 @@
  *   Weight:   FP4 E2M1 (nibble-packed, same layout) → PSHUFB lookup → BF16
  *   Act:      BF16 direct (BufferABF16Impl, no online INT8 quantization)
  *   Dot prod: _mm512_dpbf16_ps (BF16×BF16→FP32) instead of _mm512_dpbssd_epi32
- *   Scale:    FP32 per-group scale (weight only, no activation scale)
+ *   Scale:    native E4M3 group-16 or FP32 group-32 weight scale
  **/
 #ifndef CPUINFER_OPERATOR_AMX_FP4_MOE_H
 #define CPUINFER_OPERATOR_AMX_FP4_MOE_H
+
+#include <cstdlib>
+#include <cstring>
 
 #include "la/amx_raw_buffers.hpp"  // BufferABF16Impl
 #include "moe_base.hpp"
 
 namespace amx {
+
+inline bool use_nvfp4_blocked_layout() {
+#if defined(__AVX512BF16__)
+  static const bool enabled = [] {
+    const char* value = std::getenv("KT_NVFP4_BLOCKED_LAYOUT");
+    if (value == nullptr || *value == '\0') return true;
+    return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+           std::strcmp(value, "false") != 0;
+  }();
+  return enabled;
+#else
+  return false;
+#endif
+}
+
+// Group-32 MXFP4 keeps the historical row-major representation. Native
+// group-16 NVFP4 is reordered into 16-output tiles so one DPBF16 vector
+// produces 16 output channels and their E4M3 scales can be applied together.
+// The packed weights and one-byte scales retain the checkpoint's 0.5625-byte
+// per-parameter footprint.
+template <typename K>
+struct BufferBMXFP4KGroupImpl {
+  using dt = typename K::dt;
+  dt* b;
+  float* d;
+  float tensor_scale = 1.0f;
+  int n, k, k_group_size, k_group_count;
+
+  static constexpr int N_STEP = K::N_STEP;
+  static constexpr int N_BLOCK = K::N_BLOCK;
+  static constexpr int NVFP4_N_TILE = 16;
+  static constexpr int NVFP4_K_GROUP = 16;
+
+  static size_t required_size(int n, int k, int k_group_size) {
+    const size_t weight_bytes = (size_t)n * k / 2;
+    const size_t scale_count = (size_t)n * (k / k_group_size);
+    const size_t scale_bytes =
+        scale_count * (k_group_size == NVFP4_K_GROUP ? sizeof(uint8_t) : sizeof(float));
+    return (weight_bytes + scale_bytes + 63) & ~size_t{63};
+  }
+
+  BufferBMXFP4KGroupImpl(int n, int k, int k_group_size, void* ptr)
+      : n(n), k(k), k_group_size(k_group_size), k_group_count(k / k_group_size) {
+    assert(reinterpret_cast<intptr_t>(ptr) % 64 == 0);
+    if (n % N_STEP || k % K::K_STEP || k % k_group_size) {
+      throw std::runtime_error("MXFP4 buffer dimensions are not aligned");
+    }
+    b = reinterpret_cast<dt*>(ptr);
+    d = reinterpret_cast<float*>(offset_pointer(b, (size_t)n * k / 2));
+  }
+
+  bool blocked_nvfp4() const {
+    return k_group_size == NVFP4_K_GROUP && use_nvfp4_blocked_layout();
+  }
+
+  static std::pair<int, int> split_rows(int n, int ith, int nth) {
+    const int block_count = (n + N_BLOCK - 1) / N_BLOCK;
+    const int blocks_per_thread = (block_count + nth - 1) / nth;
+    const int start = std::min(n, ith * blocks_per_thread * N_BLOCK);
+    const int end = std::min(n, start + blocks_per_thread * N_BLOCK);
+    return {start, end};
+  }
+
+  size_t nvfp4_weight_tile_offset(int n_begin, int k_group_begin) const {
+    const int n_block_begin = n_begin / N_BLOCK * N_BLOCK;
+    const int n_tile = (n_begin - n_block_begin) / NVFP4_N_TILE;
+    const int k_group = k_group_begin / NVFP4_K_GROUP;
+    const size_t n_tile_bytes = (size_t)NVFP4_N_TILE * k / 2;
+    const size_t k_group_bytes = (size_t)NVFP4_N_TILE * NVFP4_K_GROUP / 2;
+    return (size_t)n_block_begin * k / 2 + (size_t)n_tile * n_tile_bytes +
+           (size_t)k_group * k_group_bytes;
+  }
+
+  size_t nvfp4_scale_tile_offset(int n_begin, int k_group_begin) const {
+    const int n_block_begin = n_begin / N_BLOCK * N_BLOCK;
+    const int n_tile = (n_begin - n_block_begin) / NVFP4_N_TILE;
+    const int k_group = k_group_begin / NVFP4_K_GROUP;
+    return (size_t)n_block_begin * k_group_count +
+           (size_t)n_tile * NVFP4_N_TILE * k_group_count +
+           (size_t)k_group * NVFP4_N_TILE;
+  }
+
+  const uint8_t* get_nvfp4_weight_tile(int n_begin, int k_group_begin) const {
+    return reinterpret_cast<const uint8_t*>(b) +
+           nvfp4_weight_tile_offset(n_begin, k_group_begin);
+  }
+
+  uint8_t* get_nvfp4_weight_tile(int n_begin, int k_group_begin) {
+    return reinterpret_cast<uint8_t*>(b) +
+           nvfp4_weight_tile_offset(n_begin, k_group_begin);
+  }
+
+  const uint8_t* get_nvfp4_scale_tile(int n_begin, int k_group_begin) const {
+    return reinterpret_cast<const uint8_t*>(d) +
+           nvfp4_scale_tile_offset(n_begin, k_group_begin);
+  }
+
+  uint8_t* get_nvfp4_scale_tile(int n_begin, int k_group_begin) {
+    return reinterpret_cast<uint8_t*>(d) +
+           nvfp4_scale_tile_offset(n_begin, k_group_begin);
+  }
+
+  // Transpose 16 output rows x 8 packed K-pair bytes into eight contiguous
+  // 16-byte vectors. This is the exact layout consumed by the decode kernel.
+  static void transpose_nvfp4_weight_tile(const uint8_t* src,
+                                           size_t row_stride, uint8_t* dst) {
+    __m128i rows[16];
+    for (int row = 0; row < 16; ++row) {
+      rows[row] = _mm_loadl_epi64(
+          reinterpret_cast<const __m128i*>(src + (size_t)row * row_stride));
+    }
+
+    const __m128i a0 = _mm_unpacklo_epi8(rows[0], rows[1]);
+    const __m128i a1 = _mm_unpacklo_epi8(rows[2], rows[3]);
+    const __m128i a2 = _mm_unpacklo_epi8(rows[4], rows[5]);
+    const __m128i a3 = _mm_unpacklo_epi8(rows[6], rows[7]);
+    const __m128i a4 = _mm_unpacklo_epi8(rows[8], rows[9]);
+    const __m128i a5 = _mm_unpacklo_epi8(rows[10], rows[11]);
+    const __m128i a6 = _mm_unpacklo_epi8(rows[12], rows[13]);
+    const __m128i a7 = _mm_unpacklo_epi8(rows[14], rows[15]);
+
+    const __m128i b0 = _mm_unpacklo_epi16(a0, a1);
+    const __m128i b1 = _mm_unpackhi_epi16(a0, a1);
+    const __m128i b2 = _mm_unpacklo_epi16(a2, a3);
+    const __m128i b3 = _mm_unpackhi_epi16(a2, a3);
+    const __m128i b4 = _mm_unpacklo_epi16(a4, a5);
+    const __m128i b5 = _mm_unpackhi_epi16(a4, a5);
+    const __m128i b6 = _mm_unpacklo_epi16(a6, a7);
+    const __m128i b7 = _mm_unpackhi_epi16(a6, a7);
+
+    const __m128i c0 = _mm_unpacklo_epi32(b0, b2);
+    const __m128i c1 = _mm_unpackhi_epi32(b0, b2);
+    const __m128i c2 = _mm_unpacklo_epi32(b1, b3);
+    const __m128i c3 = _mm_unpackhi_epi32(b1, b3);
+    const __m128i c4 = _mm_unpacklo_epi32(b4, b6);
+    const __m128i c5 = _mm_unpackhi_epi32(b4, b6);
+    const __m128i c6 = _mm_unpacklo_epi32(b5, b7);
+    const __m128i c7 = _mm_unpackhi_epi32(b5, b7);
+
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 0 * 16),
+                     _mm_unpacklo_epi64(c0, c4));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 1 * 16),
+                     _mm_unpackhi_epi64(c0, c4));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 2 * 16),
+                     _mm_unpacklo_epi64(c1, c5));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 3 * 16),
+                     _mm_unpackhi_epi64(c1, c5));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 4 * 16),
+                     _mm_unpacklo_epi64(c2, c6));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 5 * 16),
+                     _mm_unpackhi_epi64(c2, c6));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 6 * 16),
+                     _mm_unpacklo_epi64(c3, c7));
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 7 * 16),
+                     _mm_unpackhi_epi64(c3, c7));
+  }
+
+  void from_nvfp4_rows(const uint8_t* weights, size_t weight_row_stride,
+                       const uint8_t* scales, size_t scale_row_stride,
+                       int ith, int nth) {
+    if (k_group_size != NVFP4_K_GROUP) {
+      throw std::runtime_error("from_nvfp4_rows requires group_size=16");
+    }
+    auto [n_start, n_end] = split_rows(n, ith, nth);
+    if (n_start >= n_end) return;
+
+    if (!blocked_nvfp4()) {
+      const size_t row_bytes = (size_t)k / 2;
+      for (int row = n_start; row < n_end; ++row) {
+        std::memcpy(reinterpret_cast<uint8_t*>(b) + (size_t)row * row_bytes,
+                    weights + (size_t)row * weight_row_stride, row_bytes);
+        if (scales != nullptr) {
+          std::memcpy(reinterpret_cast<uint8_t*>(d) + (size_t)row * k_group_count,
+                      scales + (size_t)row * scale_row_stride, k_group_count);
+        }
+      }
+      return;
+    }
+
+    for (int n_begin = n_start; n_begin < n_end; n_begin += NVFP4_N_TILE) {
+      for (int k_begin = 0; k_begin < k; k_begin += NVFP4_K_GROUP) {
+        uint8_t* weight_tile = get_nvfp4_weight_tile(n_begin, k_begin);
+        transpose_nvfp4_weight_tile(
+            weights + (size_t)n_begin * weight_row_stride + k_begin / 2,
+            weight_row_stride, weight_tile);
+        if (scales != nullptr) {
+          uint8_t* scale_tile = get_nvfp4_scale_tile(n_begin, k_begin);
+          const int group = k_begin / NVFP4_K_GROUP;
+          for (int lane = 0; lane < NVFP4_N_TILE; ++lane) {
+            scale_tile[lane] =
+                scales[(size_t)(n_begin + lane) * scale_row_stride + group];
+          }
+        }
+      }
+    }
+  }
+
+  void from_raw_mat(const uint8_t* weights, int ith, int nth) {
+    if (k_group_size == NVFP4_K_GROUP) {
+      from_nvfp4_rows(weights, (size_t)k / 2, nullptr, 0, ith, nth);
+      return;
+    }
+    auto [n_start, n_end] = split_rows(n, ith, nth);
+    const size_t row_bytes = (size_t)k / 2;
+    std::memcpy(reinterpret_cast<uint8_t*>(b) + (size_t)n_start * row_bytes,
+                weights + (size_t)n_start * row_bytes,
+                (size_t)(n_end - n_start) * row_bytes);
+  }
+
+  dt* get_submat(int, int k_, int n_begin, int k_begin) {
+    return reinterpret_cast<dt*>(reinterpret_cast<uint8_t*>(b) +
+                                 (size_t)n_begin * k_ / 2 + k_begin / 2);
+  }
+
+  float* get_scale(int, int n_begin, int k_, int k_begin) {
+    return d + (size_t)n_begin * (k_ / k_group_size) + k_begin / k_group_size;
+  }
+
+  uint8_t* get_native_scale(int, int n_begin, int k_, int k_begin) {
+    return reinterpret_cast<uint8_t*>(d) +
+           (size_t)n_begin * (k_ / k_group_size) + k_begin / k_group_size;
+  }
+
+  const uint8_t* get_native_scale(int, int n_begin, int k_, int k_begin) const {
+    return reinterpret_cast<const uint8_t*>(d) +
+           (size_t)n_begin * (k_ / k_group_size) + k_begin / k_group_size;
+  }
+};
 
 // ============================================================================
 // MXFP4 kernel: FP4 E2M1 weights × BF16 activations → FP32 output (AVX512)
@@ -143,8 +374,100 @@ struct GemmKernel224MXFP4SmallKGroup {
 
   // Buffers
   using BufferA = BufferABF16Impl<GemmKernel224MXFP4SmallKGroup>;        // raw BF16, no quant
-  using BufferB = BufferBInt4KGroupImpl<GemmKernel224MXFP4SmallKGroup>;  // nibble-packed FP4
+  using BufferB = BufferBMXFP4KGroupImpl<GemmKernel224MXFP4SmallKGroup>;
   using BufferC = BufferCReduceImpl<GemmKernel224MXFP4SmallKGroup>;      // FP32 reduce
+
+#if defined(__AVX512BF16__)
+  // Convert 16 native E4M3FN scale bytes directly to FP32. Normal values map
+  // to IEEE exponents with one shift/add; only the eight subnormal magnitudes
+  // need a small vector lookup. Weight scales are kept byte-packed in RAM.
+  __attribute__((always_inline)) static inline __m512 e4m3fnx16_to_fp32(
+      const uint8_t* packed) {
+    const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(packed));
+    const __m512i raw = _mm512_cvtepu8_epi32(bytes);
+    const __m512i magnitude = _mm512_and_si512(raw, _mm512_set1_epi32(0x7F));
+    const __m512i sign = _mm512_slli_epi32(
+        _mm512_and_si512(raw, _mm512_set1_epi32(0x80)), 24);
+
+    const __m512i normal_bits = _mm512_add_epi32(
+        _mm512_slli_epi32(magnitude, 20), _mm512_set1_epi32(0x3C000000));
+    const __m512 subnormal_lut = _mm512_setr_ps(
+        0.0f, 0.001953125f, 0.00390625f, 0.005859375f,
+        0.0078125f, 0.009765625f, 0.01171875f, 0.013671875f,
+        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+    const __m512 subnormal = _mm512_permutexvar_ps(magnitude, subnormal_lut);
+    const __mmask16 is_subnormal = _mm512_cmplt_epi32_mask(
+        magnitude, _mm512_set1_epi32(8));
+    const __m512 magnitude_value = _mm512_mask_blend_ps(
+        is_subnormal, _mm512_castsi512_ps(normal_bits), subnormal);
+    return _mm512_castsi512_ps(
+        _mm512_or_si512(_mm512_castps_si512(magnitude_value), sign));
+  }
+
+  __attribute__((always_inline)) static inline __m512bh broadcast_bf16_pair(
+      const ggml_bf16_t* values) {
+    uint32_t pair;
+    std::memcpy(&pair, values, sizeof(pair));
+    return (__m512bh)_mm512_set1_epi32(pair);
+  }
+
+  // Decode-oriented kernel. B is arranged as eight packed K-pairs across 16
+  // output rows. DPBF16 therefore accumulates 16 independent output channels
+  // and one scale vector handles the complete group-16 tile.
+  static void fp4_mat_vec_nvfp4_blocked(int m, int n, int k, BufferA* ba,
+                                        BufferB* bb, BufferC* bc, int ith,
+                                        int nth) {
+    auto [n_start, n_end] = split_range_n(n, ith, nth);
+    if (n_start >= n_end) return;
+    if (k > K_BLOCK) {
+      throw std::runtime_error("Blocked NVFP4 kernel requires k <= K_BLOCK");
+    }
+
+    const __m512 tensor_scale = _mm512_set1_ps(bb->tensor_scale);
+    for (int m_idx = 0; m_idx < m; ++m_idx) {
+      const ggml_bf16_t* a_row = ba->get_submat(m, k, m_idx, 0);
+      for (int n_pos = n_start; n_pos < n_end; n_pos += 16) {
+        __m512 total = _mm512_setzero_ps();
+
+        for (int k_begin = 0; k_begin < k; k_begin += 16) {
+          const uint8_t* weights = bb->get_nvfp4_weight_tile(n_pos, k_begin);
+          __m512 partial0 = _mm512_setzero_ps();
+          __m512 partial1 = _mm512_setzero_ps();
+          __m512 partial2 = _mm512_setzero_ps();
+          __m512 partial3 = _mm512_setzero_ps();
+
+#define NVFP4_DP_PAIR(PAIR, ACC)                                                   \
+  do {                                                                             \
+    const DequantizedWeight weight(                                                \
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(weights + (PAIR) * 16))); \
+    const ActivationBF16 activation(                                               \
+        broadcast_bf16_pair(a_row + k_begin + (PAIR) * 2));                        \
+    (ACC) = _mm512_dpbf16_ps((ACC), activation.a, weight.d);                       \
+  } while (0)
+          NVFP4_DP_PAIR(0, partial0);
+          NVFP4_DP_PAIR(1, partial1);
+          NVFP4_DP_PAIR(2, partial2);
+          NVFP4_DP_PAIR(3, partial3);
+          NVFP4_DP_PAIR(4, partial0);
+          NVFP4_DP_PAIR(5, partial1);
+          NVFP4_DP_PAIR(6, partial2);
+          NVFP4_DP_PAIR(7, partial3);
+#undef NVFP4_DP_PAIR
+
+          const __m512 group_sum = _mm512_add_ps(
+              _mm512_add_ps(partial0, partial1),
+              _mm512_add_ps(partial2, partial3));
+          const __m512 scales = e4m3fnx16_to_fp32(
+              bb->get_nvfp4_scale_tile(n_pos, k_begin));
+          total = _mm512_fmadd_ps(group_sum, scales, total);
+        }
+
+        float* output = bc->get_submat(m, n, m_idx, n_pos);
+        _mm512_storeu_ps(output, _mm512_mul_ps(total, tensor_scale));
+      }
+    }
+  }
+#endif
 
   // 4 个 zmm 的 horizontal reduce → 4 个连续 fp32。
   // 4 次 reduce_add_ps 之间无依赖，编译器/CPU 可并行调度。
@@ -226,6 +549,12 @@ struct GemmKernel224MXFP4SmallKGroup {
 
   static void fp4_mat_vec_kgroup(int m, int n, int k, int k_group_size, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
                                  int nth) {
+#if defined(__AVX512BF16__)
+    if (k_group_size == 16 && bb->blocked_nvfp4()) {
+      fp4_mat_vec_nvfp4_blocked(m, n, k, ba, bb, bc, ith, nth);
+      return;
+    }
+#endif
     if (k_group_size == 16) {
       fp4_mat_vec_kgroup_impl<16>(m, n, k, ba, bb, bc, ith, nth);
     } else if (k_group_size == 32) {
@@ -370,6 +699,12 @@ struct GemmKernel224MXFP4SmallKGroup {
 
   static void fp4_mat_mat_kgroup(int m, int n, int k, int k_group_size, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
                                  int nth) {
+#if defined(__AVX512BF16__)
+    if (k_group_size == 16 && bb->blocked_nvfp4()) {
+      fp4_mat_vec_nvfp4_blocked(m, n, k, ba, bb, bc, ith, nth);
+      return;
+    }
+#endif
     if (k_group_size == 16) {
       fp4_mat_mat_kgroup_impl<16>(m, n, k, ba, bb, bc, ith, nth);
     } else if (k_group_size == 32) {
@@ -430,7 +765,11 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     if ((quant_config.group_size == 16) != (quant_config.quant_method == "NVFP4")) {
       throw std::runtime_error("AMX FP4 group_size=16 is reserved for native ModelOpt NVFP4");
     }
-    printf("Creating AMX_FP4_MOE_TP %d at numa %d\n", tp_part_idx, numa_node_of_cpu(sched_getcpu()));
+    const char* layout = quant_config.group_size == 16 && amx::use_nvfp4_blocked_layout()
+                             ? "blocked-n16"
+                             : "row-major";
+    printf("Creating AMX_FP4_MOE_TP %d at numa %d (layout=%s)\n", tp_part_idx,
+           numa_node_of_cpu(sched_getcpu()), layout);
   }
 
   ~AMX_FP4_MOE_TP() = default;
@@ -787,39 +1126,30 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
 
             const size_t gate_weight_bytes = (size_t)local_intermediate * tpc.hidden_size / 2;
             const size_t gate_weight_offset = (size_t)numa_id * gate_weight_bytes;
-            // The kernel partitioner assigns one fixed N_BLOCK per task, so
-            // from_raw_mat(..., 0, 1) would copy only the first output block.
-            std::memcpy(tp->gate_bb_[expert_id]->b,
-                        (const uint8_t*)config.gate_projs[0][logical_id] + gate_weight_offset, gate_weight_bytes);
-            std::memcpy(tp->up_bb_[expert_id]->b,
-                        (const uint8_t*)config.up_projs[0][logical_id] + gate_weight_offset, gate_weight_bytes);
-
             const size_t gate_scale_count = (size_t)local_intermediate * hidden_groups;
             const size_t gate_scale_offset = (size_t)numa_id * gate_scale_count;
-            std::memcpy(reinterpret_cast<uint8_t*>(tp->gate_bb_[expert_id]->d),
-                        (const uint8_t*)config.gate_scales[0][logical_id] + gate_scale_offset, gate_scale_count);
-            std::memcpy(reinterpret_cast<uint8_t*>(tp->up_bb_[expert_id]->d),
-                        (const uint8_t*)config.up_scales[0][logical_id] + gate_scale_offset, gate_scale_count);
+            tp->gate_bb_[expert_id]->from_nvfp4_rows(
+                (const uint8_t*)config.gate_projs[0][logical_id] + gate_weight_offset,
+                tpc.hidden_size / 2,
+                (const uint8_t*)config.gate_scales[0][logical_id] + gate_scale_offset,
+                hidden_groups, 0, 1);
+            tp->up_bb_[expert_id]->from_nvfp4_rows(
+                (const uint8_t*)config.up_projs[0][logical_id] + gate_weight_offset,
+                tpc.hidden_size / 2,
+                (const uint8_t*)config.up_scales[0][logical_id] + gate_scale_offset,
+                hidden_groups, 0, 1);
             tp->gate_bb_[expert_id]->tensor_scale = *(const float*)config.gate_scale2s[0][logical_id];
             tp->up_bb_[expert_id]->tensor_scale = *(const float*)config.up_scale2s[0][logical_id];
 
             const uint8_t* down_weight = (const uint8_t*)config.down_projs[0][logical_id];
             const uint8_t* down_scale = (const uint8_t*)config.down_scales[0][logical_id];
-            uint8_t* down_weight_dst = (uint8_t*)tp->down_bb_[expert_id]->b;
-            uint8_t* down_scale_dst = reinterpret_cast<uint8_t*>(tp->down_bb_[expert_id]->d);
             const size_t local_down_row_bytes = (size_t)local_intermediate / 2;
             const size_t full_down_row_bytes = (size_t)full_intermediate / 2;
-            for (int row = 0; row < tpc.hidden_size; ++row) {
-              std::memcpy(
-                  down_weight_dst + (size_t)row * local_down_row_bytes,
-                  down_weight + (size_t)row * full_down_row_bytes +
-                      (size_t)numa_id * local_down_row_bytes,
-                  local_down_row_bytes);
-              std::memcpy(down_scale_dst + (size_t)row * local_intermediate_groups,
-                          down_scale + (size_t)row * full_intermediate_groups +
-                              (size_t)numa_id * local_intermediate_groups,
-                          local_intermediate_groups);
-            }
+            tp->down_bb_[expert_id]->from_nvfp4_rows(
+                down_weight + (size_t)numa_id * local_down_row_bytes,
+                full_down_row_bytes,
+                down_scale + (size_t)numa_id * local_intermediate_groups,
+                full_intermediate_groups, 0, 1);
             tp->down_bb_[expert_id]->tensor_scale = *(const float*)config.down_scale2s[0][logical_id];
           },
           nullptr);
