@@ -77,6 +77,20 @@ inline int nvfp4_n_block() {
 #endif
 }
 
+inline bool use_nvfp4_fused_gate_up() {
+#if defined(__AVX512BF16__)
+  static const bool enabled = [] {
+    const char* value = std::getenv("KT_NVFP4_FUSED_GATE_UP");
+    if (value == nullptr || *value == '\0') return true;
+    return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+           std::strcmp(value, "false") != 0;
+  }();
+  return enabled;
+#else
+  return false;
+#endif
+}
+
 // Group-32 MXFP4 keeps the historical row-major representation. Native
 // group-16 NVFP4 is reordered into 16-output tiles so one DPBF16 vector
 // produces 16 output channels and their E4M3 scales can be applied together.
@@ -632,6 +646,45 @@ struct GemmKernel224MXFP4SmallKGroup {
       }
     }
   }
+
+  // Pipeline fusion keeps the proven projection kernel and combines its
+  // worker task, BF16 boundary, activation, and down-input packing. This
+  // avoids increasing the projection kernel's live accumulator count.
+  static void fp4_gate_up_nvfp4_blocked_pipeline(
+      int n, int k, BufferA* ba, BufferB* gate_bb, BufferC* gate_bc,
+      BufferB* up_bb, BufferC* up_bc, BufferA* down_ba, int ith, int nth,
+      float swiglu_limit, float swiglu_alpha) {
+    fp4_mat_vec_nvfp4_blocked_two_tiles(1, n, k, ba, gate_bb, gate_bc, ith,
+                                        nth);
+    fp4_mat_vec_nvfp4_blocked_two_tiles(1, n, k, ba, up_bb, up_bc, ith, nth);
+
+    auto [n_start, n_end] = split_range_n(n, ith, nth);
+    alignas(64) ggml_bf16_t gate_rounded[32];
+    alignas(64) ggml_bf16_t up_rounded[32];
+    for (int n_pos = n_start; n_pos < n_end; n_pos += 32) {
+      __m512 gate0 = _mm512_loadu_ps(gate_bc->get_submat(1, n, 0, n_pos));
+      __m512 gate1 =
+          _mm512_loadu_ps(gate_bc->get_submat(1, n, 0, n_pos) + 16);
+      __m512 up0 = _mm512_loadu_ps(up_bc->get_submat(1, n, 0, n_pos));
+      __m512 up1 =
+          _mm512_loadu_ps(up_bc->get_submat(1, n, 0, n_pos) + 16);
+
+      avx512_32xfp32_to_32xbf16(&gate0, &gate1,
+                                reinterpret_cast<__m512i*>(gate_rounded));
+      avx512_32xfp32_to_32xbf16(&up0, &up1,
+                                reinterpret_cast<__m512i*>(up_rounded));
+      avx512_32xbf16_to_32xfp32(reinterpret_cast<__m512i*>(gate_rounded),
+                                &gate0, &gate1);
+      avx512_32xbf16_to_32xfp32(reinterpret_cast<__m512i*>(up_rounded), &up0,
+                                &up1);
+
+      __m512 activated0 = act_fn(gate0, up0, swiglu_limit, swiglu_alpha);
+      __m512 activated1 = act_fn(gate1, up1, swiglu_limit, swiglu_alpha);
+      avx512_32xfp32_to_32xbf16(
+          &activated0, &activated1,
+          reinterpret_cast<__m512i*>(down_ba->get_submat(1, n, 0, n_pos)));
+    }
+  }
 #endif
 
   // 4 个 zmm 的 horizontal reduce → 4 个连续 fp32。
@@ -920,6 +973,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
   using Base::gate_bb_;
   using Base::gate_bc_;
   using Base::gate_up_ba_;
+  using Base::m_expert_id_map_;
   using Base::m_local_num_;
   using Base::tp_part_idx;
   using Base::up_bb_;
@@ -945,14 +999,15 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     const char* layout = blocked ? "blocked-n16" : "row-major";
     printf(
         "Creating AMX_FP4_MOE_TP %d at numa %d (layout=%s, decode_tiles=%d, "
-        "prefetch_groups=%d, n_block=%d)\n",
+        "prefetch_groups=%d, n_block=%d, fused_gate_up=%d)\n",
         tp_part_idx, numa_node_of_cpu(sched_getcpu()), layout,
         blocked ? amx::nvfp4_decode_tile_batch() : 1,
         blocked && amx::nvfp4_decode_tile_batch() == 2
             ? amx::nvfp4_prefetch_groups()
             : 0,
         blocked ? amx::nvfp4_n_block()
-                : amx::GemmKernel224MXFP4SmallKGroup::N_BLOCK);
+                : amx::GemmKernel224MXFP4SmallKGroup::N_BLOCK,
+        blocked && amx::use_nvfp4_fused_gate_up());
   }
 
   ~AMX_FP4_MOE_TP() = default;
@@ -986,6 +1041,38 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     } else {
       amx::vec_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
     }
+  }
+
+  bool decode_gate_up_activation(int activated_expert, int qlen) {
+#if defined(__AVX512BF16__)
+    if (qlen != 1 || config_.quant_config.group_size != 16 ||
+        !amx::use_nvfp4_blocked_layout() ||
+        amx::nvfp4_decode_tile_batch() != 2 ||
+        !amx::use_nvfp4_fused_gate_up()) {
+      return false;
+    }
+
+    const int nth = T::recommended_nth(config_.intermediate_size);
+    auto pool = config_.pool->get_subpool(tp_part_idx);
+    pool->do_work_stealing_job(
+        nth * activated_expert, [](int) { T::config(); },
+        [this, nth](int task_id) {
+          const int expert_idx = m_expert_id_map_[task_id / nth];
+          const int ith = task_id % nth;
+          T::fp4_gate_up_nvfp4_blocked_pipeline(
+              config_.intermediate_size, config_.hidden_size,
+              gate_up_ba_[expert_idx].get(), gate_bb_[expert_idx].get(),
+              gate_bc_[expert_idx].get(), up_bb_[expert_idx].get(),
+              up_bc_[expert_idx].get(), down_ba_[expert_idx].get(), ith, nth,
+              config_.swiglu_limit, config_.swiglu_alpha);
+        },
+        nullptr);
+    return true;
+#else
+    (void)activated_expert;
+    (void)qlen;
+    return false;
+#endif
   }
 
   void do_down_gemm(int expert_idx, int ith, int nth, int qlen) {
