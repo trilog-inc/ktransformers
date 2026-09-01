@@ -14,6 +14,8 @@
 #ifndef CPUINFER_OPERATOR_AMX_FP4_MOE_H
 #define CPUINFER_OPERATOR_AMX_FP4_MOE_H
 
+#include <type_traits>
+
 #include "la/amx_raw_buffers.hpp"  // BufferABF16Impl
 #include "moe_base.hpp"
 
@@ -128,6 +130,36 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
   };
 
+  // ModelOpt NVFP4 has two independently scaled groups in every 32-value
+  // packed vector.  Keep those groups in explicit FP32 lanes instead of
+  // relying on the lane layout of a single DPBF16 result.  Group-size-32
+  // MXFP4 continues to use the native AVX512-BF16 path above.
+  struct ActivationFP32 {
+    __m512 even;
+    __m512 odd;
+
+    __attribute__((always_inline)) explicit ActivationFP32(__m512bh packed) {
+      const __m512i bits = (__m512i)packed;
+      even = _mm512_castsi512_ps(_mm512_slli_epi32(bits, 16));
+      odd = _mm512_castsi512_ps(_mm512_and_si512(bits, _mm512_set1_epi32(0xFFFF0000)));
+    }
+  };
+
+  struct DequantizedWeightFP32 {
+    __m512 even;
+    __m512 odd;
+
+    __attribute__((always_inline)) explicit DequantizedWeightFP32(__m128i packed) {
+      const __m128i nibble_mask = _mm_set1_epi8(0x0F);
+      const __m128i lo = _mm_and_si128(packed, nibble_mask);
+      const __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), nibble_mask);
+      const __m512 lut = _mm512_setr_ps(0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f, -0.0f, -0.5f,
+                                        -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f);
+      even = _mm512_permutexvar_ps(_mm512_cvtepu8_epi32(lo), lut);
+      odd = _mm512_permutexvar_ps(_mm512_cvtepu8_epi32(hi), lut);
+    }
+  };
+
   __attribute__((always_inline)) static inline __m512 mxfp4_dot_bf16(const DequantizedWeight& w,
                                                                      const ActivationBF16& act) {
 #if defined(__AVX512BF16__)
@@ -136,6 +168,27 @@ struct GemmKernel224MXFP4SmallKGroup {
     __m512 dot = _mm512_mul_ps(act.a_odd, w.w_odd);
     return _mm512_fmadd_ps(act.a_even, w.w_even, dot);
 #endif
+  }
+
+  __attribute__((always_inline)) static inline __m512 mxfp4_dot_fp32(const DequantizedWeightFP32& w,
+                                                                     const ActivationFP32& act) {
+    return _mm512_fmadd_ps(act.even, w.even, _mm512_mul_ps(act.odd, w.odd));
+  }
+
+  template <int GROUP_SIZE>
+  using ActivationFor = std::conditional_t<GROUP_SIZE == 16, ActivationFP32, ActivationBF16>;
+
+  template <int GROUP_SIZE>
+  using DequantizedWeightFor = std::conditional_t<GROUP_SIZE == 16, DequantizedWeightFP32, DequantizedWeight>;
+
+  template <int GROUP_SIZE>
+  __attribute__((always_inline)) static inline __m512 mxfp4_dot(const DequantizedWeightFor<GROUP_SIZE>& w,
+                                                                const ActivationFor<GROUP_SIZE>& act) {
+    if constexpr (GROUP_SIZE == 16) {
+      return mxfp4_dot_fp32(w, act);
+    } else {
+      return mxfp4_dot_bf16(w, act);
+    }
   }
 
   template <int GROUP_SIZE>
@@ -149,9 +202,8 @@ struct GemmKernel224MXFP4SmallKGroup {
       const auto& lut = e4m3fn_lut();
       const __m512 first = _mm512_set1_ps(lut[scales[vector_idx * 2]]);
       const __m512 second = _mm512_set1_ps(lut[scales[vector_idx * 2 + 1]]);
-      // DPBF16 produces 16 FP32 lanes, each reducing two adjacent BF16
-      // products. Lanes 0..7 belong to the first NVFP4 group and lanes 8..15
-      // to the second.
+      // Each FP32 lane reduces one adjacent activation/weight pair. Lanes
+      // 0..7 belong to the first NVFP4 group and lanes 8..15 to the second.
       return _mm512_mask_blend_ps(0xFF00, first, second);
     }
   }
@@ -211,15 +263,15 @@ struct GemmKernel224MXFP4SmallKGroup {
         __m512 acc3 = _mm512_setzero_ps();
 
         for (int g = 0; g < kg_count; g++) {
-          const ActivationBF16 a(a_row[g]);
-          const DequantizedWeight d0(w0[g]);
-          const DequantizedWeight d1(w1[g]);
-          const DequantizedWeight d2(w2[g]);
-          const DequantizedWeight d3(w3[g]);
-          acc0 = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s0, g), mxfp4_dot_bf16(d0, a), acc0);
-          acc1 = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s1, g), mxfp4_dot_bf16(d1, a), acc1);
-          acc2 = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s2, g), mxfp4_dot_bf16(d2, a), acc2);
-          acc3 = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s3, g), mxfp4_dot_bf16(d3, a), acc3);
+          const ActivationFor<GROUP_SIZE> a(a_row[g]);
+          const DequantizedWeightFor<GROUP_SIZE> d0(w0[g]);
+          const DequantizedWeightFor<GROUP_SIZE> d1(w1[g]);
+          const DequantizedWeightFor<GROUP_SIZE> d2(w2[g]);
+          const DequantizedWeightFor<GROUP_SIZE> d3(w3[g]);
+          acc0 = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s0, g), mxfp4_dot<GROUP_SIZE>(d0, a), acc0);
+          acc1 = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s1, g), mxfp4_dot<GROUP_SIZE>(d1, a), acc1);
+          acc2 = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s2, g), mxfp4_dot<GROUP_SIZE>(d2, a), acc2);
+          acc3 = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s3, g), mxfp4_dot<GROUP_SIZE>(d3, a), acc3);
         }
         reduce4<GROUP_SIZE>(acc0, acc1, acc2, acc3, c_row + (n_pos - n_start), bb);
       }
@@ -230,9 +282,9 @@ struct GemmKernel224MXFP4SmallKGroup {
                                          : static_cast<const void*>(bb->get_scale(n, n_pos, k, 0));
         __m512 acc = _mm512_setzero_ps();
         for (int g = 0; g < kg_count; g++) {
-          const ActivationBF16 a(a_row[g]);
-          const DequantizedWeight d(w[g]);
-          acc = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s, g), mxfp4_dot_bf16(d, a), acc);
+          const ActivationFor<GROUP_SIZE> a(a_row[g]);
+          const DequantizedWeightFor<GROUP_SIZE> d(w[g]);
+          acc = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s, g), mxfp4_dot<GROUP_SIZE>(d, a), acc);
         }
         c_row[n_pos - n_start] = finalize<GROUP_SIZE>(_mm512_reduce_add_ps(acc), bb);
       }
@@ -291,10 +343,10 @@ struct GemmKernel224MXFP4SmallKGroup {
 
         for (int g = 0; g < kg_count; g++) {
           // 4 行权重解码一次, MB 个 token 共享
-          const DequantizedWeight d0(w0[g]);
-          const DequantizedWeight d1(w1[g]);
-          const DequantizedWeight d2(w2[g]);
-          const DequantizedWeight d3(w3[g]);
+          const DequantizedWeightFor<GROUP_SIZE> d0(w0[g]);
+          const DequantizedWeightFor<GROUP_SIZE> d1(w1[g]);
+          const DequantizedWeightFor<GROUP_SIZE> d2(w2[g]);
+          const DequantizedWeightFor<GROUP_SIZE> d3(w3[g]);
           const __m512 sv0 = load_group_scales<GROUP_SIZE>(s0, g);
           const __m512 sv1 = load_group_scales<GROUP_SIZE>(s1, g);
           const __m512 sv2 = load_group_scales<GROUP_SIZE>(s2, g);
@@ -302,11 +354,11 @@ struct GemmKernel224MXFP4SmallKGroup {
 
 #define V_FMA_ROW(M_I)                                                      \
   do {                                                                      \
-    const ActivationBF16 a(a_rows[M_I][g]);                                 \
-    acc[M_I][0] = _mm512_fmadd_ps(sv0, mxfp4_dot_bf16(d0, a), acc[M_I][0]); \
-    acc[M_I][1] = _mm512_fmadd_ps(sv1, mxfp4_dot_bf16(d1, a), acc[M_I][1]); \
-    acc[M_I][2] = _mm512_fmadd_ps(sv2, mxfp4_dot_bf16(d2, a), acc[M_I][2]); \
-    acc[M_I][3] = _mm512_fmadd_ps(sv3, mxfp4_dot_bf16(d3, a), acc[M_I][3]); \
+    const ActivationFor<GROUP_SIZE> a(a_rows[M_I][g]);                                      \
+    acc[M_I][0] = _mm512_fmadd_ps(sv0, mxfp4_dot<GROUP_SIZE>(d0, a), acc[M_I][0]);           \
+    acc[M_I][1] = _mm512_fmadd_ps(sv1, mxfp4_dot<GROUP_SIZE>(d1, a), acc[M_I][1]);           \
+    acc[M_I][2] = _mm512_fmadd_ps(sv2, mxfp4_dot<GROUP_SIZE>(d2, a), acc[M_I][2]);           \
+    acc[M_I][3] = _mm512_fmadd_ps(sv3, mxfp4_dot<GROUP_SIZE>(d3, a), acc[M_I][3]);           \
   } while (0)
           V_FMA_ROW(0);
           V_FMA_ROW(1);
@@ -328,9 +380,9 @@ struct GemmKernel224MXFP4SmallKGroup {
           float* c_row = bc->get_submat(m, n, m_pos + i, n_start);
           __m512 acc = _mm512_setzero_ps();
           for (int g = 0; g < kg_count; g++) {
-            const ActivationBF16 a(a_rows[i][g]);
-            const DequantizedWeight d(w[g]);
-            acc = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s, g), mxfp4_dot_bf16(d, a), acc);
+            const ActivationFor<GROUP_SIZE> a(a_rows[i][g]);
+            const DequantizedWeightFor<GROUP_SIZE> d(w[g]);
+            acc = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s, g), mxfp4_dot<GROUP_SIZE>(d, a), acc);
           }
           c_row[n_pos - n_start] = finalize<GROUP_SIZE>(_mm512_reduce_add_ps(acc), bb);
         }
@@ -356,15 +408,15 @@ struct GemmKernel224MXFP4SmallKGroup {
                                           : static_cast<const void*>(bb->get_scale(n, n_pos + 3, k, 0));
         __m512 a0 = _mm512_setzero_ps(), a1 = _mm512_setzero_ps(), a2 = _mm512_setzero_ps(), a3 = _mm512_setzero_ps();
         for (int g = 0; g < kg_count; g++) {
-          const ActivationBF16 a(a_row[g]);
-          const DequantizedWeight d0(w0[g]);
-          const DequantizedWeight d1(w1[g]);
-          const DequantizedWeight d2(w2[g]);
-          const DequantizedWeight d3(w3[g]);
-          a0 = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s0, g), mxfp4_dot_bf16(d0, a), a0);
-          a1 = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s1, g), mxfp4_dot_bf16(d1, a), a1);
-          a2 = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s2, g), mxfp4_dot_bf16(d2, a), a2);
-          a3 = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s3, g), mxfp4_dot_bf16(d3, a), a3);
+          const ActivationFor<GROUP_SIZE> a(a_row[g]);
+          const DequantizedWeightFor<GROUP_SIZE> d0(w0[g]);
+          const DequantizedWeightFor<GROUP_SIZE> d1(w1[g]);
+          const DequantizedWeightFor<GROUP_SIZE> d2(w2[g]);
+          const DequantizedWeightFor<GROUP_SIZE> d3(w3[g]);
+          a0 = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s0, g), mxfp4_dot<GROUP_SIZE>(d0, a), a0);
+          a1 = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s1, g), mxfp4_dot<GROUP_SIZE>(d1, a), a1);
+          a2 = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s2, g), mxfp4_dot<GROUP_SIZE>(d2, a), a2);
+          a3 = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s3, g), mxfp4_dot<GROUP_SIZE>(d3, a), a3);
         }
         reduce4<GROUP_SIZE>(a0, a1, a2, a3, c_row + (n_pos - n_start), bb);
       }
@@ -374,9 +426,9 @@ struct GemmKernel224MXFP4SmallKGroup {
                                          : static_cast<const void*>(bb->get_scale(n, n_pos, k, 0));
         __m512 acc = _mm512_setzero_ps();
         for (int g = 0; g < kg_count; g++) {
-          const ActivationBF16 a(a_row[g]);
-          const DequantizedWeight d(w[g]);
-          acc = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s, g), mxfp4_dot_bf16(d, a), acc);
+          const ActivationFor<GROUP_SIZE> a(a_row[g]);
+          const DequantizedWeightFor<GROUP_SIZE> d(w[g]);
+          acc = _mm512_fmadd_ps(load_group_scales<GROUP_SIZE>(s, g), mxfp4_dot<GROUP_SIZE>(d, a), acc);
         }
         c_row[n_pos - n_start] = finalize<GROUP_SIZE>(_mm512_reduce_add_ps(acc), bb);
       }
