@@ -76,8 +76,18 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help=(
-            "Route this many experts in each timed forward. The expert count "
-            "must be divisible by top-k so timing can rotate disjoint banks."
+            "Number of routed expert slots in each timed forward."
+        ),
+    )
+    parser.add_argument(
+        "--benchmark-cpu-top-k",
+        type=int,
+        default=None,
+        help=(
+            "Number of routed experts computed by the CPU backend. Remaining "
+            "top-k slots are marked inactive to reproduce experts skipped by "
+            "the heterogeneous GPU path. Defaults to "
+            "--benchmark-top-k."
         ),
     )
     return parser.parse_args()
@@ -102,9 +112,16 @@ def load_checkpoint_experts(args: argparse.Namespace):
         raise ValueError("--benchmark-expert-count must be at least 1")
     if args.benchmark_top_k < 1:
         raise ValueError("--benchmark-top-k must be at least 1")
-    if args.benchmark_expert_count % args.benchmark_top_k:
+    if args.benchmark_cpu_top_k is None:
+        args.benchmark_cpu_top_k = args.benchmark_top_k
+    if not 1 <= args.benchmark_cpu_top_k <= args.benchmark_top_k:
         raise ValueError(
-            "--benchmark-expert-count must be divisible by --benchmark-top-k"
+            "--benchmark-cpu-top-k must be between 1 and --benchmark-top-k"
+        )
+    if args.benchmark_expert_count % args.benchmark_cpu_top_k:
+        raise ValueError(
+            "--benchmark-expert-count must be divisible by "
+            "--benchmark-cpu-top-k"
         )
     expert_ids = list(
         range(args.expert, args.expert + args.benchmark_expert_count)
@@ -222,11 +239,16 @@ def build_native_moe(
 
 
 def native_forward(
-    moe, cpu_infer, inputs: torch.Tensor, top_k: int
+    moe,
+    cpu_infer,
+    inputs: torch.Tensor,
+    top_k: int,
+    cpu_top_k: int,
 ) -> torch.Tensor:
     output = torch.empty_like(inputs)
     batch_size = torch.ones(1, dtype=torch.int32)
-    expert_ids = torch.arange(top_k, dtype=torch.int64).view(1, top_k)
+    expert_ids = torch.full((1, top_k), -1, dtype=torch.int64)
+    expert_ids[0, :cpu_top_k] = torch.arange(cpu_top_k, dtype=torch.int64)
     routing_weights = torch.zeros((1, top_k), dtype=torch.float32)
     routing_weights[0, 0] = 1.0
     cpu_infer.submit(
@@ -254,6 +276,7 @@ def benchmark_native_forward(
     intermediate_size: int,
     expert_count: int,
     top_k: int,
+    cpu_top_k: int,
     repeats: int,
 ) -> None:
     if iterations <= 0:
@@ -263,13 +286,15 @@ def benchmark_native_forward(
 
     output = torch.empty_like(inputs)
     batch_size = torch.ones(1, dtype=torch.int32)
-    expert_ids = [
-        torch.arange(start, start + top_k, dtype=torch.int64).view(1, top_k)
-        for start in range(0, expert_count, top_k)
-    ]
-    routing_weights = torch.full(
-        (1, top_k), 1.0 / top_k, dtype=torch.float32
-    )
+    expert_ids = []
+    for start in range(0, expert_count, cpu_top_k):
+        route = torch.full((1, top_k), -1, dtype=torch.int64)
+        route[0, :cpu_top_k] = torch.arange(
+            start, start + cpu_top_k, dtype=torch.int64
+        )
+        expert_ids.append(route)
+    routing_weights = torch.zeros((1, top_k), dtype=torch.float32)
+    routing_weights[0, :cpu_top_k] = 1.0 / cpu_top_k
     route_count = len(expert_ids)
 
     def run_once(expert_index: int) -> None:
@@ -301,11 +326,14 @@ def benchmark_native_forward(
     seconds_per_forward = statistics.median(samples)
     projection_elements = 3 * hidden_size * intermediate_size
     checkpoint_bytes = projection_elements * (0.5 + 1.0 / 16.0)
-    effective_gbps = checkpoint_bytes * top_k / seconds_per_forward / 1e9
+    effective_gbps = (
+        checkpoint_bytes * cpu_top_k / seconds_per_forward / 1e9
+    )
     benchmark_kind = "LLC-hot" if expert_count == 1 else "rotating"
     working_set_gb = checkpoint_bytes * expert_count / 1e9
     print(
-        f"  benchmark ({benchmark_kind}, experts={expert_count}, top_k={top_k}, "
+        f"  benchmark ({benchmark_kind}, experts={expert_count}, "
+        f"route_top_k={top_k}, cpu_top_k={cpu_top_k}, "
         f"weight_working_set={working_set_gb:.3f} GB): "
         f"{seconds_per_forward * 1e3:.3f} ms/forward "
         f"{1.0 / seconds_per_forward:.3f} forwards/s "
@@ -364,7 +392,11 @@ def main() -> None:
             backend, cpu_infer, weight_bank, args
         )
         actual = native_forward(
-            moe, cpu_infer, inputs, args.benchmark_top_k
+            moe,
+            cpu_infer,
+            inputs,
+            args.benchmark_top_k,
+            args.benchmark_cpu_top_k,
         )
         difference = (actual.float() - expected.float()).abs()
         relative_error = difference.mean().item() / (expected_mean + 1e-12)
@@ -389,6 +421,7 @@ def main() -> None:
             args.intermediate_size,
             len(weight_bank),
             args.benchmark_top_k,
+            args.benchmark_cpu_top_k,
             args.benchmark_repeats,
         )
         del moe, physical_to_logical, cpu_infer, actual
