@@ -63,6 +63,18 @@ inline int nvfp4_prefetch_groups() {
 #endif
 }
 
+inline int nvfp4_n_block() {
+#if defined(__AVX512BF16__)
+  static const int block = [] {
+    const char* value = std::getenv("KT_NVFP4_N_BLOCK");
+    return value != nullptr && std::strcmp(value, "128") == 0 ? 128 : 256;
+  }();
+  return block;
+#else
+  return 256;
+#endif
+}
+
 // Group-32 MXFP4 keeps the historical row-major representation. Native
 // group-16 NVFP4 is reordered into 16-output tiles so one DPBF16 vector
 // produces 16 output channels and their E4M3 scales can be applied together.
@@ -104,15 +116,17 @@ struct BufferBMXFP4KGroupImpl {
   }
 
   static std::pair<int, int> split_rows(int n, int ith, int nth) {
-    const int block_count = (n + N_BLOCK - 1) / N_BLOCK;
+    const int n_block = nvfp4_n_block();
+    const int block_count = (n + n_block - 1) / n_block;
     const int blocks_per_thread = (block_count + nth - 1) / nth;
-    const int start = std::min(n, ith * blocks_per_thread * N_BLOCK);
-    const int end = std::min(n, start + blocks_per_thread * N_BLOCK);
+    const int start = std::min(n, ith * blocks_per_thread * n_block);
+    const int end = std::min(n, start + blocks_per_thread * n_block);
     return {start, end};
   }
 
   size_t nvfp4_weight_tile_offset(int n_begin, int k_group_begin) const {
-    const int n_block_begin = n_begin / N_BLOCK * N_BLOCK;
+    const int n_block = nvfp4_n_block();
+    const int n_block_begin = n_begin / n_block * n_block;
     const int n_tile = (n_begin - n_block_begin) / NVFP4_N_TILE;
     const int k_group = k_group_begin / NVFP4_K_GROUP;
     const size_t n_tile_bytes = (size_t)NVFP4_N_TILE * k / 2;
@@ -122,7 +136,8 @@ struct BufferBMXFP4KGroupImpl {
   }
 
   size_t nvfp4_scale_tile_offset(int n_begin, int k_group_begin) const {
-    const int n_block_begin = n_begin / N_BLOCK * N_BLOCK;
+    const int n_block = nvfp4_n_block();
+    const int n_block_begin = n_begin / n_block * n_block;
     const int n_tile = (n_begin - n_block_begin) / NVFP4_N_TILE;
     const int k_group = k_group_begin / NVFP4_K_GROUP;
     return (size_t)n_block_begin * k_group_count +
@@ -293,10 +308,14 @@ struct GemmKernel224MXFP4SmallKGroup {
   static inline const int K_BLOCK = 7168;
 
   static std::string name() { return "MXFP4_KGROUP"; }
-  static int recommended_nth(int n) { return (n + N_BLOCK - 1) / N_BLOCK; }
+  static int recommended_nth(int n) {
+    const int n_block = nvfp4_n_block();
+    return (n + n_block - 1) / n_block;
+  }
   static std::pair<int, int> split_range_n(int n, int ith, int nth) {
-    int n_start = N_BLOCK * ith;
-    int n_end = std::min(n, N_BLOCK * (ith + 1));
+    const int n_block = nvfp4_n_block();
+    int n_start = n_block * ith;
+    int n_end = std::min(n, n_block * (ith + 1));
     return {n_start, n_end};
   }
   static void config() {}
@@ -924,12 +943,14 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     const char* layout = blocked ? "blocked-n16" : "row-major";
     printf(
         "Creating AMX_FP4_MOE_TP %d at numa %d (layout=%s, decode_tiles=%d, "
-        "prefetch_groups=%d)\n",
+        "prefetch_groups=%d, n_block=%d)\n",
         tp_part_idx, numa_node_of_cpu(sched_getcpu()), layout,
         blocked ? amx::nvfp4_decode_tile_batch() : 1,
         blocked && amx::nvfp4_decode_tile_batch() == 2
             ? amx::nvfp4_prefetch_groups()
-            : 0);
+            : 0,
+        blocked ? amx::nvfp4_n_block()
+                : amx::GemmKernel224MXFP4SmallKGroup::N_BLOCK);
   }
 
   ~AMX_FP4_MOE_TP() = default;
