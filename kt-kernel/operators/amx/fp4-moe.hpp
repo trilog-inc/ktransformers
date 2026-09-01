@@ -53,7 +53,7 @@ inline int nvfp4_prefetch_groups() {
 #if defined(__AVX512BF16__)
   static const int distance = [] {
     const char* value = std::getenv("KT_NVFP4_PREFETCH_GROUPS");
-    if (value == nullptr || *value == '\0') return 0;
+    if (value == nullptr || *value == '\0') return 5;
     const int parsed = std::atoi(value);
     return parsed > 0 ? parsed : 0;
   }();
