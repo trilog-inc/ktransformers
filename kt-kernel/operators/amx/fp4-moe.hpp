@@ -40,7 +40,8 @@ inline int nvfp4_decode_tile_batch() {
 #if defined(__AVX512BF16__)
   static const int tile_batch = [] {
     const char* value = std::getenv("KT_NVFP4_DECODE_TILE_BATCH");
-    return value != nullptr && std::strcmp(value, "2") == 0 ? 2 : 1;
+    if (value == nullptr || *value == '\0') return 2;
+    return std::strcmp(value, "1") == 0 ? 1 : 2;
   }();
   return tile_batch;
 #else
