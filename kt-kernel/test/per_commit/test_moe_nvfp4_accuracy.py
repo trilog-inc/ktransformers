@@ -15,7 +15,9 @@ import kt_kernel_ext
 
 EXPERT_NUM = 4
 HIDDEN_SIZE = 128
-INTERMEDIATE_SIZE = 128
+# Cross the AMX kernel's 256-row partition boundary so single-task checkpoint
+# loads must copy more than the first output block.
+INTERMEDIATE_SIZE = 320
 TOP_K = 2
 MAX_LEN = 16
 GROUP_SIZE = 16
