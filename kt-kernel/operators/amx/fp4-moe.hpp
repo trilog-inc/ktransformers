@@ -36,6 +36,32 @@ inline bool use_nvfp4_blocked_layout() {
 #endif
 }
 
+inline int nvfp4_decode_tile_batch() {
+#if defined(__AVX512BF16__)
+  static const int tile_batch = [] {
+    const char* value = std::getenv("KT_NVFP4_DECODE_TILE_BATCH");
+    return value != nullptr && std::strcmp(value, "2") == 0 ? 2 : 1;
+  }();
+  return tile_batch;
+#else
+  return 1;
+#endif
+}
+
+inline int nvfp4_prefetch_groups() {
+#if defined(__AVX512BF16__)
+  static const int distance = [] {
+    const char* value = std::getenv("KT_NVFP4_PREFETCH_GROUPS");
+    if (value == nullptr || *value == '\0') return 0;
+    const int parsed = std::atoi(value);
+    return parsed > 0 ? parsed : 0;
+  }();
+  return distance;
+#else
+  return 0;
+#endif
+}
+
 // Group-32 MXFP4 keeps the historical row-major representation. Native
 // group-16 NVFP4 is reordered into 16-output tiles so one DPBF16 vector
 // produces 16 output channels and their E4M3 scales can be applied together.
@@ -467,6 +493,123 @@ struct GemmKernel224MXFP4SmallKGroup {
       }
     }
   }
+
+  // Process two adjacent output tiles together. Both tiles use the same
+  // activation pair, so its load and broadcast are paid once for 32 outputs.
+  // Optional software prefetching is kept runtime-tunable because the useful
+  // distance depends strongly on the CPU and memory topology.
+  static void fp4_mat_vec_nvfp4_blocked_two_tiles(
+      int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
+      int nth) {
+    auto [n_start, n_end] = split_range_n(n, ith, nth);
+    if (n_start >= n_end) return;
+    if (k > K_BLOCK) {
+      throw std::runtime_error("Blocked NVFP4 kernel requires k <= K_BLOCK");
+    }
+    assert((n_end - n_start) % 32 == 0);
+
+    constexpr size_t WEIGHT_GROUP_BYTES =
+        BufferB::NVFP4_N_TILE * BufferB::NVFP4_K_GROUP / 2;
+    constexpr size_t SCALE_GROUP_BYTES = BufferB::NVFP4_N_TILE;
+    const int group_count = k / BufferB::NVFP4_K_GROUP;
+    const int prefetch_groups = nvfp4_prefetch_groups();
+    const __m512 tensor_scale = _mm512_set1_ps(bb->tensor_scale);
+
+    for (int m_idx = 0; m_idx < m; ++m_idx) {
+      const ggml_bf16_t* a_row = ba->get_submat(m, k, m_idx, 0);
+      for (int n_pos = n_start; n_pos < n_end; n_pos += 32) {
+        const uint8_t* weight_base0 = bb->get_nvfp4_weight_tile(n_pos, 0);
+        const uint8_t* weight_base1 =
+            bb->get_nvfp4_weight_tile(n_pos + 16, 0);
+        const uint8_t* scale_base0 = bb->get_nvfp4_scale_tile(n_pos, 0);
+        const uint8_t* scale_base1 =
+            bb->get_nvfp4_scale_tile(n_pos + 16, 0);
+        __m512 total0 = _mm512_setzero_ps();
+        __m512 total1 = _mm512_setzero_ps();
+
+        for (int group = 0; group < group_count; ++group) {
+          const size_t weight_offset = (size_t)group * WEIGHT_GROUP_BYTES;
+          const size_t scale_offset = (size_t)group * SCALE_GROUP_BYTES;
+          const uint8_t* weights0 = weight_base0 + weight_offset;
+          const uint8_t* weights1 = weight_base1 + weight_offset;
+
+          const int future_group = group + prefetch_groups;
+          if (prefetch_groups > 0 && future_group < group_count) {
+            const size_t future_weight_offset =
+                (size_t)future_group * WEIGHT_GROUP_BYTES;
+            const size_t future_scale_offset =
+                (size_t)future_group * SCALE_GROUP_BYTES;
+            const uint8_t* future_weights0 =
+                weight_base0 + future_weight_offset;
+            const uint8_t* future_weights1 =
+                weight_base1 + future_weight_offset;
+            _mm_prefetch(reinterpret_cast<const char*>(future_weights0),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(future_weights0 + 64),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(future_weights1),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(future_weights1 + 64),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(scale_base0 +
+                                                       future_scale_offset),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(scale_base1 +
+                                                       future_scale_offset),
+                         _MM_HINT_T0);
+          }
+
+          __m512 partial00 = _mm512_setzero_ps();
+          __m512 partial01 = _mm512_setzero_ps();
+          __m512 partial02 = _mm512_setzero_ps();
+          __m512 partial03 = _mm512_setzero_ps();
+          __m512 partial10 = _mm512_setzero_ps();
+          __m512 partial11 = _mm512_setzero_ps();
+          __m512 partial12 = _mm512_setzero_ps();
+          __m512 partial13 = _mm512_setzero_ps();
+
+#define NVFP4_DP_PAIR_TWO_TILES(PAIR, ACC0, ACC1)                              \
+  do {                                                                          \
+    const ActivationBF16 activation(broadcast_bf16_pair(                       \
+        a_row + group * BufferB::NVFP4_K_GROUP + (PAIR) * 2));                 \
+    const DequantizedWeight weight0(_mm_loadu_si128(                           \
+        reinterpret_cast<const __m128i*>(weights0 + (PAIR) * 16)));            \
+    const DequantizedWeight weight1(_mm_loadu_si128(                           \
+        reinterpret_cast<const __m128i*>(weights1 + (PAIR) * 16)));            \
+    (ACC0) = _mm512_dpbf16_ps((ACC0), activation.a, weight0.d);                \
+    (ACC1) = _mm512_dpbf16_ps((ACC1), activation.a, weight1.d);                \
+  } while (0)
+          NVFP4_DP_PAIR_TWO_TILES(0, partial00, partial10);
+          NVFP4_DP_PAIR_TWO_TILES(1, partial01, partial11);
+          NVFP4_DP_PAIR_TWO_TILES(2, partial02, partial12);
+          NVFP4_DP_PAIR_TWO_TILES(3, partial03, partial13);
+          NVFP4_DP_PAIR_TWO_TILES(4, partial00, partial10);
+          NVFP4_DP_PAIR_TWO_TILES(5, partial01, partial11);
+          NVFP4_DP_PAIR_TWO_TILES(6, partial02, partial12);
+          NVFP4_DP_PAIR_TWO_TILES(7, partial03, partial13);
+#undef NVFP4_DP_PAIR_TWO_TILES
+
+          const __m512 group_sum0 = _mm512_add_ps(
+              _mm512_add_ps(partial00, partial01),
+              _mm512_add_ps(partial02, partial03));
+          const __m512 group_sum1 = _mm512_add_ps(
+              _mm512_add_ps(partial10, partial11),
+              _mm512_add_ps(partial12, partial13));
+          const __m512 scales0 =
+              e4m3fnx16_to_fp32(scale_base0 + scale_offset);
+          const __m512 scales1 =
+              e4m3fnx16_to_fp32(scale_base1 + scale_offset);
+          total0 = _mm512_fmadd_ps(group_sum0, scales0, total0);
+          total1 = _mm512_fmadd_ps(group_sum1, scales1, total1);
+        }
+
+        float* output = bc->get_submat(m, n, m_idx, n_pos);
+        _mm512_storeu_ps(output, _mm512_mul_ps(total0, tensor_scale));
+        _mm512_storeu_ps(output + 16,
+                         _mm512_mul_ps(total1, tensor_scale));
+      }
+    }
+  }
 #endif
 
   // 4 个 zmm 的 horizontal reduce → 4 个连续 fp32。
@@ -551,7 +694,12 @@ struct GemmKernel224MXFP4SmallKGroup {
                                  int nth) {
 #if defined(__AVX512BF16__)
     if (k_group_size == 16 && bb->blocked_nvfp4()) {
-      fp4_mat_vec_nvfp4_blocked(m, n, k, ba, bb, bc, ith, nth);
+      if (nvfp4_decode_tile_batch() == 2) {
+        fp4_mat_vec_nvfp4_blocked_two_tiles(m, n, k, ba, bb, bc, ith,
+                                            nth);
+      } else {
+        fp4_mat_vec_nvfp4_blocked(m, n, k, ba, bb, bc, ith, nth);
+      }
       return;
     }
 #endif
@@ -701,7 +849,12 @@ struct GemmKernel224MXFP4SmallKGroup {
                                  int nth) {
 #if defined(__AVX512BF16__)
     if (k_group_size == 16 && bb->blocked_nvfp4()) {
-      fp4_mat_vec_nvfp4_blocked(m, n, k, ba, bb, bc, ith, nth);
+      if (nvfp4_decode_tile_batch() == 2) {
+        fp4_mat_vec_nvfp4_blocked_two_tiles(m, n, k, ba, bb, bc, ith,
+                                            nth);
+      } else {
+        fp4_mat_vec_nvfp4_blocked(m, n, k, ba, bb, bc, ith, nth);
+      }
       return;
     }
 #endif
@@ -765,11 +918,17 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     if ((quant_config.group_size == 16) != (quant_config.quant_method == "NVFP4")) {
       throw std::runtime_error("AMX FP4 group_size=16 is reserved for native ModelOpt NVFP4");
     }
-    const char* layout = quant_config.group_size == 16 && amx::use_nvfp4_blocked_layout()
-                             ? "blocked-n16"
-                             : "row-major";
-    printf("Creating AMX_FP4_MOE_TP %d at numa %d (layout=%s)\n", tp_part_idx,
-           numa_node_of_cpu(sched_getcpu()), layout);
+    const bool blocked =
+        quant_config.group_size == 16 && amx::use_nvfp4_blocked_layout();
+    const char* layout = blocked ? "blocked-n16" : "row-major";
+    printf(
+        "Creating AMX_FP4_MOE_TP %d at numa %d (layout=%s, decode_tiles=%d, "
+        "prefetch_groups=%d)\n",
+        tp_part_idx, numa_node_of_cpu(sched_getcpu()), layout,
+        blocked ? amx::nvfp4_decode_tile_batch() : 1,
+        blocked && amx::nvfp4_decode_tile_batch() == 2
+            ? amx::nvfp4_prefetch_groups()
+            : 0);
   }
 
   ~AMX_FP4_MOE_TP() = default;
