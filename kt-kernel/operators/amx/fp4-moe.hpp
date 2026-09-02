@@ -1271,7 +1271,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
         "weight_decode=%s)\n",
         tp_part_idx, numa_node_of_cpu(sched_getcpu()), layout,
         blocked ? amx::nvfp4_decode_tile_batch() : 1,
-        blocked && amx::nvfp4_decode_tile_batch() == 2
+        blocked && amx::nvfp4_decode_tile_batch() > 1
             ? amx::nvfp4_prefetch_groups()
             : 0,
         blocked ? amx::nvfp4_n_block()
