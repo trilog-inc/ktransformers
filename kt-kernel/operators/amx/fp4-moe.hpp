@@ -91,28 +91,6 @@ inline bool use_nvfp4_bf16_scales() {
 #endif
 }
 
-inline bool use_nvfp4_fp16_scales() {
-#if defined(__AVX512BF16__)
-  static const bool enabled = [] {
-    const char* value = std::getenv("KT_NVFP4_FP16_SCALES");
-    if (value == nullptr || *value == '\0') return false;
-    return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
-           std::strcmp(value, "false") != 0;
-  }();
-  return enabled;
-#else
-  return false;
-#endif
-}
-
-enum class NVFP4ScaleStorage { E4M3, BF16, FP16 };
-
-inline NVFP4ScaleStorage configured_nvfp4_scale_storage() {
-  if (use_nvfp4_fp16_scales()) return NVFP4ScaleStorage::FP16;
-  if (use_nvfp4_bf16_scales()) return NVFP4ScaleStorage::BF16;
-  return NVFP4ScaleStorage::E4M3;
-}
-
 inline bool use_nvfp4_vbmi_decode() {
 #if defined(__AVX512BF16__) && defined(__AVX512VBMI__) && \
     defined(__AVX512VL__)
@@ -132,8 +110,8 @@ inline bool use_nvfp4_vbmi_decode() {
 // group-16 NVFP4 is reordered into 16-output tiles so one DPBF16 vector
 // produces 16 output channels and their E4M3 scales can be applied together.
 // The packed weights and one-byte scales retain the checkpoint's 0.5625-byte
-// per-parameter footprint by default. Opt-in BF16 or FP16 scale layouts use
-// 0.625 bytes per parameter to reduce scale conversion in the decode loop.
+// per-parameter footprint by default. An opt-in BF16 scale layout uses 0.625
+// bytes per parameter to remove E4M3 conversion from the decode inner loop.
 template <typename K>
 struct BufferBMXFP4KGroupImpl {
   using dt = typename K::dt;
@@ -150,13 +128,13 @@ struct BufferBMXFP4KGroupImpl {
   static size_t required_size(int n, int k, int k_group_size) {
     const size_t weight_bytes = (size_t)n * k / 2;
     const size_t scale_count = (size_t)n * (k / k_group_size);
-    const bool expanded_scales =
-        k_group_size == NVFP4_K_GROUP && use_nvfp4_blocked_layout() &&
-        configured_nvfp4_scale_storage() != NVFP4ScaleStorage::E4M3;
+    const bool bf16_scales = k_group_size == NVFP4_K_GROUP &&
+                             use_nvfp4_blocked_layout() &&
+                             use_nvfp4_bf16_scales();
     const size_t scale_bytes = scale_count *
                                (k_group_size == NVFP4_K_GROUP
-                                    ? (expanded_scales ? sizeof(uint16_t)
-                                                       : sizeof(uint8_t))
+                                    ? (bf16_scales ? sizeof(ggml_bf16_t)
+                                                   : sizeof(uint8_t))
                                     : sizeof(float));
     return (weight_bytes + scale_bytes + 63) & ~size_t{63};
   }
@@ -175,9 +153,8 @@ struct BufferBMXFP4KGroupImpl {
     return k_group_size == NVFP4_K_GROUP && use_nvfp4_blocked_layout();
   }
 
-  NVFP4ScaleStorage nvfp4_scale_storage() const {
-    return blocked_nvfp4() ? configured_nvfp4_scale_storage()
-                           : NVFP4ScaleStorage::E4M3;
+  bool bf16_nvfp4_scales() const {
+    return blocked_nvfp4() && use_nvfp4_bf16_scales();
   }
 
   static std::pair<int, int> split_rows(int n, int ith, int nth) {
@@ -213,9 +190,7 @@ struct BufferBMXFP4KGroupImpl {
   size_t nvfp4_scale_tile_byte_offset(int n_begin,
                                        int k_group_begin) const {
     const size_t element_size =
-        nvfp4_scale_storage() == NVFP4ScaleStorage::E4M3
-            ? sizeof(uint8_t)
-            : sizeof(uint16_t);
+        bf16_nvfp4_scales() ? sizeof(ggml_bf16_t) : sizeof(uint8_t);
     return nvfp4_scale_tile_offset(n_begin, k_group_begin) * element_size;
   }
 
@@ -325,16 +300,7 @@ struct BufferBMXFP4KGroupImpl {
         if (scales != nullptr) {
           uint8_t* scale_tile = get_nvfp4_scale_tile(n_begin, k_begin);
           const int group = k_begin / NVFP4_K_GROUP;
-          if (nvfp4_scale_storage() == NVFP4ScaleStorage::FP16) {
-            ggml_fp16_t* fp16_scale_tile =
-                reinterpret_cast<ggml_fp16_t*>(scale_tile);
-            const auto& lut = e4m3fn_lut();
-            for (int lane = 0; lane < NVFP4_N_TILE; ++lane) {
-              const uint8_t scale =
-                  scales[(size_t)(n_begin + lane) * scale_row_stride + group];
-              fp16_scale_tile[lane] = GGML_FP32_TO_FP16(lut[scale]);
-            }
-          } else if (nvfp4_scale_storage() == NVFP4ScaleStorage::BF16) {
+          if (bf16_nvfp4_scales()) {
             ggml_bf16_t* bf16_scale_tile =
                 reinterpret_cast<ggml_bf16_t*>(scale_tile);
             const auto& lut = e4m3fn_lut();
@@ -593,14 +559,10 @@ struct GemmKernel224MXFP4SmallKGroup {
     return _mm512_castsi512_ps(bits);
   }
 
-  template <NVFP4ScaleStorage SCALE_STORAGE>
+  template <bool BF16_SCALE>
   __attribute__((always_inline)) static inline __m512 load_nvfp4_scales(
       const uint8_t* packed) {
-    if constexpr (SCALE_STORAGE == NVFP4ScaleStorage::FP16) {
-      const __m256i values =
-          _mm256_loadu_si256(reinterpret_cast<const __m256i*>(packed));
-      return _mm512_cvtph_ps(values);
-    } else if constexpr (SCALE_STORAGE == NVFP4ScaleStorage::BF16) {
+    if constexpr (BF16_SCALE) {
       return bf16x16_to_fp32(packed);
     }
     return e4m3fnx16_to_fp32(packed);
@@ -616,7 +578,7 @@ struct GemmKernel224MXFP4SmallKGroup {
   // Decode-oriented kernel. B is arranged as eight packed K-pairs across 16
   // output rows. DPBF16 therefore accumulates 16 independent output channels
   // and one scale vector handles the complete group-16 tile.
-  template <NVFP4ScaleStorage SCALE_STORAGE, bool VBMI_DECODE>
+  template <bool BF16_SCALE, bool VBMI_DECODE>
   static void fp4_mat_vec_nvfp4_blocked(int m, int n, int k, BufferA* ba,
                                         BufferB* bb, BufferC* bc, int ith,
                                         int nth) {
@@ -660,7 +622,7 @@ struct GemmKernel224MXFP4SmallKGroup {
           const __m512 group_sum = _mm512_add_ps(
               _mm512_add_ps(partial0, partial1),
               _mm512_add_ps(partial2, partial3));
-          const __m512 scales = load_nvfp4_scales<SCALE_STORAGE>(
+          const __m512 scales = load_nvfp4_scales<BF16_SCALE>(
               bb->get_nvfp4_scale_tile(n_pos, k_begin));
           total = _mm512_fmadd_ps(group_sum, scales, total);
         }
@@ -675,7 +637,7 @@ struct GemmKernel224MXFP4SmallKGroup {
   // activation pair, so its load and broadcast are paid once for 32 outputs.
   // Optional software prefetching is kept runtime-tunable because the useful
   // distance depends strongly on the CPU and memory topology.
-  template <NVFP4ScaleStorage SCALE_STORAGE, bool VBMI_DECODE>
+  template <bool BF16_SCALE, bool VBMI_DECODE>
   static void fp4_mat_vec_nvfp4_blocked_two_tiles(
       int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
       int nth) {
@@ -690,8 +652,7 @@ struct GemmKernel224MXFP4SmallKGroup {
         BufferB::NVFP4_N_TILE * BufferB::NVFP4_K_GROUP / 2;
     constexpr size_t SCALE_GROUP_BYTES =
         BufferB::NVFP4_N_TILE *
-        (SCALE_STORAGE == NVFP4ScaleStorage::E4M3 ? sizeof(uint8_t)
-                                                  : sizeof(uint16_t));
+        (BF16_SCALE ? sizeof(ggml_bf16_t) : sizeof(uint8_t));
     const int group_count = k / BufferB::NVFP4_K_GROUP;
     const int prefetch_groups = nvfp4_prefetch_groups();
     const __m512 tensor_scale = _mm512_set1_ps(bb->tensor_scale);
@@ -777,9 +738,9 @@ struct GemmKernel224MXFP4SmallKGroup {
               _mm512_add_ps(partial10, partial11),
               _mm512_add_ps(partial12, partial13));
           const __m512 scales0 =
-              load_nvfp4_scales<SCALE_STORAGE>(scale_base0 + scale_offset);
+              load_nvfp4_scales<BF16_SCALE>(scale_base0 + scale_offset);
           const __m512 scales1 =
-              load_nvfp4_scales<SCALE_STORAGE>(scale_base1 + scale_offset);
+              load_nvfp4_scales<BF16_SCALE>(scale_base1 + scale_offset);
           total0 = _mm512_fmadd_ps(group_sum0, scales0, total0);
           total1 = _mm512_fmadd_ps(group_sum1, scales1, total1);
         }
@@ -792,28 +753,28 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
   }
 
-  template <NVFP4ScaleStorage SCALE_STORAGE>
+  template <bool BF16_SCALE>
   static void fp4_mat_vec_nvfp4_blocked_dispatch(
       int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
       int nth) {
 #if defined(__AVX512VBMI__) && defined(__AVX512VL__)
     if (use_nvfp4_vbmi_decode()) {
       if (nvfp4_decode_tile_batch() == 2) {
-        fp4_mat_vec_nvfp4_blocked_two_tiles<SCALE_STORAGE, true>(
+        fp4_mat_vec_nvfp4_blocked_two_tiles<BF16_SCALE, true>(
             m, n, k, ba, bb, bc, ith, nth);
       } else {
-        fp4_mat_vec_nvfp4_blocked<SCALE_STORAGE, true>(m, n, k, ba, bb, bc,
-                                                       ith, nth);
+        fp4_mat_vec_nvfp4_blocked<BF16_SCALE, true>(m, n, k, ba, bb, bc, ith,
+                                                    nth);
       }
       return;
     }
 #endif
     if (nvfp4_decode_tile_batch() == 2) {
-      fp4_mat_vec_nvfp4_blocked_two_tiles<SCALE_STORAGE, false>(
+      fp4_mat_vec_nvfp4_blocked_two_tiles<BF16_SCALE, false>(
           m, n, k, ba, bb, bc, ith, nth);
     } else {
-      fp4_mat_vec_nvfp4_blocked<SCALE_STORAGE, false>(m, n, k, ba, bb, bc,
-                                                      ith, nth);
+      fp4_mat_vec_nvfp4_blocked<BF16_SCALE, false>(m, n, k, ba, bb, bc, ith,
+                                                   nth);
     }
   }
 #endif
@@ -900,19 +861,12 @@ struct GemmKernel224MXFP4SmallKGroup {
                                  int nth) {
 #if defined(__AVX512BF16__)
     if (k_group_size == 16 && bb->blocked_nvfp4()) {
-      switch (bb->nvfp4_scale_storage()) {
-        case NVFP4ScaleStorage::FP16:
-          fp4_mat_vec_nvfp4_blocked_dispatch<NVFP4ScaleStorage::FP16>(
-              m, n, k, ba, bb, bc, ith, nth);
-          break;
-        case NVFP4ScaleStorage::BF16:
-          fp4_mat_vec_nvfp4_blocked_dispatch<NVFP4ScaleStorage::BF16>(
-              m, n, k, ba, bb, bc, ith, nth);
-          break;
-        case NVFP4ScaleStorage::E4M3:
-          fp4_mat_vec_nvfp4_blocked_dispatch<NVFP4ScaleStorage::E4M3>(
-              m, n, k, ba, bb, bc, ith, nth);
-          break;
+      if (bb->bf16_nvfp4_scales()) {
+        fp4_mat_vec_nvfp4_blocked_dispatch<true>(m, n, k, ba, bb, bc, ith,
+                                                 nth);
+      } else {
+        fp4_mat_vec_nvfp4_blocked_dispatch<false>(m, n, k, ba, bb, bc, ith,
+                                                  nth);
       }
       return;
     }
@@ -1063,19 +1017,12 @@ struct GemmKernel224MXFP4SmallKGroup {
                                  int nth) {
 #if defined(__AVX512BF16__)
     if (k_group_size == 16 && bb->blocked_nvfp4()) {
-      switch (bb->nvfp4_scale_storage()) {
-        case NVFP4ScaleStorage::FP16:
-          fp4_mat_vec_nvfp4_blocked_dispatch<NVFP4ScaleStorage::FP16>(
-              m, n, k, ba, bb, bc, ith, nth);
-          break;
-        case NVFP4ScaleStorage::BF16:
-          fp4_mat_vec_nvfp4_blocked_dispatch<NVFP4ScaleStorage::BF16>(
-              m, n, k, ba, bb, bc, ith, nth);
-          break;
-        case NVFP4ScaleStorage::E4M3:
-          fp4_mat_vec_nvfp4_blocked_dispatch<NVFP4ScaleStorage::E4M3>(
-              m, n, k, ba, bb, bc, ith, nth);
-          break;
+      if (bb->bf16_nvfp4_scales()) {
+        fp4_mat_vec_nvfp4_blocked_dispatch<true>(m, n, k, ba, bb, bc, ith,
+                                                 nth);
+      } else {
+        fp4_mat_vec_nvfp4_blocked_dispatch<false>(m, n, k, ba, bb, bc, ith,
+                                                  nth);
       }
       return;
     }
@@ -1143,19 +1090,11 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     const bool blocked =
         quant_config.group_size == 16 && amx::use_nvfp4_blocked_layout();
     const char* layout = blocked ? "blocked-n16" : "row-major";
-    const auto configured_scale_storage =
-        amx::configured_nvfp4_scale_storage();
-    const char* scale_storage =
-        quant_config.group_size != 16
-            ? "fp32"
-            : (!blocked ? "e4m3"
-                        : (configured_scale_storage ==
-                                   amx::NVFP4ScaleStorage::FP16
-                               ? "fp16"
-                               : (configured_scale_storage ==
-                                          amx::NVFP4ScaleStorage::BF16
-                                      ? "bf16"
-                                      : "e4m3")));
+    const char* scale_storage = quant_config.group_size != 16
+                                    ? "fp32"
+                                    : (blocked && amx::use_nvfp4_bf16_scales()
+                                           ? "bf16"
+                                           : "e4m3");
     const char* weight_decode =
         blocked && amx::use_nvfp4_vbmi_decode() ? "vbmi" : "unpack";
     printf(
