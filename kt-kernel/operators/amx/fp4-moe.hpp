@@ -41,7 +41,8 @@ inline int nvfp4_decode_tile_batch() {
   static const int tile_batch = [] {
     const char* value = std::getenv("KT_NVFP4_DECODE_TILE_BATCH");
     if (value == nullptr || *value == '\0') return 2;
-    return std::strcmp(value, "1") == 0 ? 1 : 2;
+    const int parsed = std::atoi(value);
+    return parsed == 1 || parsed == 2 || parsed == 4 ? parsed : 2;
   }();
   return tile_batch;
 #else
@@ -753,13 +754,177 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
   }
 
+  // Process four adjacent output tiles while sharing each activation
+  // broadcast across 64 output channels. This is useful on CPUs with enough
+  // vector registers and memory-level parallelism to sustain the wider tile.
+  template <bool BF16_SCALE, bool VBMI_DECODE>
+  static void fp4_mat_vec_nvfp4_blocked_four_tiles(
+      int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
+      int nth) {
+    auto [n_start, n_end] = split_range_n(n, ith, nth);
+    if (n_start >= n_end) return;
+    if (k > K_BLOCK) {
+      throw std::runtime_error("Blocked NVFP4 kernel requires k <= K_BLOCK");
+    }
+    assert((n_end - n_start) % 64 == 0);
+
+    constexpr size_t WEIGHT_GROUP_BYTES =
+        BufferB::NVFP4_N_TILE * BufferB::NVFP4_K_GROUP / 2;
+    constexpr size_t SCALE_GROUP_BYTES =
+        BufferB::NVFP4_N_TILE *
+        (BF16_SCALE ? sizeof(ggml_bf16_t) : sizeof(uint8_t));
+    const int group_count = k / BufferB::NVFP4_K_GROUP;
+    const int prefetch_groups = nvfp4_prefetch_groups();
+    const __m512 tensor_scale = _mm512_set1_ps(bb->tensor_scale);
+
+    for (int m_idx = 0; m_idx < m; ++m_idx) {
+      const ggml_bf16_t* a_row = ba->get_submat(m, k, m_idx, 0);
+      for (int n_pos = n_start; n_pos < n_end; n_pos += 64) {
+        const uint8_t* weight_base0 = bb->get_nvfp4_weight_tile(n_pos, 0);
+        const uint8_t* weight_base1 =
+            bb->get_nvfp4_weight_tile(n_pos + 16, 0);
+        const uint8_t* weight_base2 =
+            bb->get_nvfp4_weight_tile(n_pos + 32, 0);
+        const uint8_t* weight_base3 =
+            bb->get_nvfp4_weight_tile(n_pos + 48, 0);
+        const uint8_t* scale_base0 = bb->get_nvfp4_scale_tile(n_pos, 0);
+        const uint8_t* scale_base1 =
+            bb->get_nvfp4_scale_tile(n_pos + 16, 0);
+        const uint8_t* scale_base2 =
+            bb->get_nvfp4_scale_tile(n_pos + 32, 0);
+        const uint8_t* scale_base3 =
+            bb->get_nvfp4_scale_tile(n_pos + 48, 0);
+        __m512 total0 = _mm512_setzero_ps();
+        __m512 total1 = _mm512_setzero_ps();
+        __m512 total2 = _mm512_setzero_ps();
+        __m512 total3 = _mm512_setzero_ps();
+
+        for (int group = 0; group < group_count; ++group) {
+          const size_t weight_offset = (size_t)group * WEIGHT_GROUP_BYTES;
+          const size_t scale_offset = (size_t)group * SCALE_GROUP_BYTES;
+          const uint8_t* weights0 = weight_base0 + weight_offset;
+          const uint8_t* weights1 = weight_base1 + weight_offset;
+          const uint8_t* weights2 = weight_base2 + weight_offset;
+          const uint8_t* weights3 = weight_base3 + weight_offset;
+
+          const int future_group = group + prefetch_groups;
+          if (prefetch_groups > 0 && future_group < group_count) {
+            const size_t future_weight_offset =
+                (size_t)future_group * WEIGHT_GROUP_BYTES;
+            const size_t future_scale_offset =
+                (size_t)future_group * SCALE_GROUP_BYTES;
+            const uint8_t* future_weights0 =
+                weight_base0 + future_weight_offset;
+            const uint8_t* future_weights1 =
+                weight_base1 + future_weight_offset;
+            const uint8_t* future_weights2 =
+                weight_base2 + future_weight_offset;
+            const uint8_t* future_weights3 =
+                weight_base3 + future_weight_offset;
+#define NVFP4_PREFETCH_WEIGHT_TILE(PTR)                            \
+  do {                                                            \
+    _mm_prefetch(reinterpret_cast<const char*>(PTR), _MM_HINT_T0); \
+    _mm_prefetch(reinterpret_cast<const char*>((PTR) + 64),        \
+                 _MM_HINT_T0);                                    \
+  } while (0)
+            NVFP4_PREFETCH_WEIGHT_TILE(future_weights0);
+            NVFP4_PREFETCH_WEIGHT_TILE(future_weights1);
+            NVFP4_PREFETCH_WEIGHT_TILE(future_weights2);
+            NVFP4_PREFETCH_WEIGHT_TILE(future_weights3);
+#undef NVFP4_PREFETCH_WEIGHT_TILE
+            _mm_prefetch(reinterpret_cast<const char*>(scale_base0 +
+                                                       future_scale_offset),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(scale_base1 +
+                                                       future_scale_offset),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(scale_base2 +
+                                                       future_scale_offset),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(scale_base3 +
+                                                       future_scale_offset),
+                         _MM_HINT_T0);
+          }
+
+          __m512 group_sum0 = _mm512_setzero_ps();
+          __m512 group_sum1 = _mm512_setzero_ps();
+          __m512 group_sum2 = _mm512_setzero_ps();
+          __m512 group_sum3 = _mm512_setzero_ps();
+
+#define NVFP4_DP_PAIR_FOUR_TILES(PAIR, ACC0, ACC1, ACC2, ACC3)                 \
+  do {                                                                         \
+    const ActivationBF16 activation(broadcast_bf16_pair(                      \
+        a_row + group * BufferB::NVFP4_K_GROUP + (PAIR) * 2));                \
+    const __m512bh weight0 = decode_nvfp4_weight<VBMI_DECODE>(_mm_loadu_si128(\
+        reinterpret_cast<const __m128i*>(weights0 + (PAIR) * 16)));           \
+    const __m512bh weight1 = decode_nvfp4_weight<VBMI_DECODE>(_mm_loadu_si128(\
+        reinterpret_cast<const __m128i*>(weights1 + (PAIR) * 16)));           \
+    const __m512bh weight2 = decode_nvfp4_weight<VBMI_DECODE>(_mm_loadu_si128(\
+        reinterpret_cast<const __m128i*>(weights2 + (PAIR) * 16)));           \
+    const __m512bh weight3 = decode_nvfp4_weight<VBMI_DECODE>(_mm_loadu_si128(\
+        reinterpret_cast<const __m128i*>(weights3 + (PAIR) * 16)));           \
+    (ACC0) = _mm512_dpbf16_ps((ACC0), activation.a, weight0);                 \
+    (ACC1) = _mm512_dpbf16_ps((ACC1), activation.a, weight1);                 \
+    (ACC2) = _mm512_dpbf16_ps((ACC2), activation.a, weight2);                 \
+    (ACC3) = _mm512_dpbf16_ps((ACC3), activation.a, weight3);                 \
+  } while (0)
+          NVFP4_DP_PAIR_FOUR_TILES(0, group_sum0, group_sum1, group_sum2,
+                                    group_sum3);
+          NVFP4_DP_PAIR_FOUR_TILES(1, group_sum0, group_sum1, group_sum2,
+                                    group_sum3);
+          NVFP4_DP_PAIR_FOUR_TILES(2, group_sum0, group_sum1, group_sum2,
+                                    group_sum3);
+          NVFP4_DP_PAIR_FOUR_TILES(3, group_sum0, group_sum1, group_sum2,
+                                    group_sum3);
+          NVFP4_DP_PAIR_FOUR_TILES(4, group_sum0, group_sum1, group_sum2,
+                                    group_sum3);
+          NVFP4_DP_PAIR_FOUR_TILES(5, group_sum0, group_sum1, group_sum2,
+                                    group_sum3);
+          NVFP4_DP_PAIR_FOUR_TILES(6, group_sum0, group_sum1, group_sum2,
+                                    group_sum3);
+          NVFP4_DP_PAIR_FOUR_TILES(7, group_sum0, group_sum1, group_sum2,
+                                    group_sum3);
+#undef NVFP4_DP_PAIR_FOUR_TILES
+
+          const __m512 scales0 =
+              load_nvfp4_scales<BF16_SCALE>(scale_base0 + scale_offset);
+          const __m512 scales1 =
+              load_nvfp4_scales<BF16_SCALE>(scale_base1 + scale_offset);
+          const __m512 scales2 =
+              load_nvfp4_scales<BF16_SCALE>(scale_base2 + scale_offset);
+          const __m512 scales3 =
+              load_nvfp4_scales<BF16_SCALE>(scale_base3 + scale_offset);
+          total0 = _mm512_fmadd_ps(group_sum0, scales0, total0);
+          total1 = _mm512_fmadd_ps(group_sum1, scales1, total1);
+          total2 = _mm512_fmadd_ps(group_sum2, scales2, total2);
+          total3 = _mm512_fmadd_ps(group_sum3, scales3, total3);
+        }
+
+        float* output = bc->get_submat(m, n, m_idx, n_pos);
+        _mm512_storeu_ps(output, _mm512_mul_ps(total0, tensor_scale));
+        _mm512_storeu_ps(output + 16,
+                         _mm512_mul_ps(total1, tensor_scale));
+        _mm512_storeu_ps(output + 32,
+                         _mm512_mul_ps(total2, tensor_scale));
+        _mm512_storeu_ps(output + 48,
+                         _mm512_mul_ps(total3, tensor_scale));
+      }
+    }
+  }
+
   template <bool BF16_SCALE>
   static void fp4_mat_vec_nvfp4_blocked_dispatch(
       int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
       int nth) {
+    const auto [n_start, n_end] = split_range_n(n, ith, nth);
+    const bool use_four_tiles = nvfp4_decode_tile_batch() == 4 &&
+                                (n_end - n_start) % 64 == 0;
 #if defined(__AVX512VBMI__) && defined(__AVX512VL__)
     if (use_nvfp4_vbmi_decode()) {
-      if (nvfp4_decode_tile_batch() == 2) {
+      if (use_four_tiles) {
+        fp4_mat_vec_nvfp4_blocked_four_tiles<BF16_SCALE, true>(
+            m, n, k, ba, bb, bc, ith, nth);
+      } else if (nvfp4_decode_tile_batch() == 2) {
         fp4_mat_vec_nvfp4_blocked_two_tiles<BF16_SCALE, true>(
             m, n, k, ba, bb, bc, ith, nth);
       } else {
@@ -769,7 +934,10 @@ struct GemmKernel224MXFP4SmallKGroup {
       return;
     }
 #endif
-    if (nvfp4_decode_tile_batch() == 2) {
+    if (use_four_tiles) {
+      fp4_mat_vec_nvfp4_blocked_four_tiles<BF16_SCALE, false>(
+          m, n, k, ba, bb, bc, ith, nth);
+    } else if (nvfp4_decode_tile_batch() == 2) {
       fp4_mat_vec_nvfp4_blocked_two_tiles<BF16_SCALE, false>(
           m, n, k, ba, bb, bc, ith, nth);
     } else {
