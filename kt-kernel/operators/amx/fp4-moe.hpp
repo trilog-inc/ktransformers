@@ -411,8 +411,11 @@ struct GemmKernel224MXFP4SmallKGroup {
 #if defined(__AVX512BF16__) && defined(__AVX512VBMI__) && \
     defined(__AVX512VL__)
   // Duplicate each packed 64-bit half, then extract its low and high eight
-  // nibbles with VPMULTISHIFTQB. This replaces the separate low/high masks,
-  // unpack chain, and lane insertion used by the portable decoder.
+  // nibbles with VPMULTISHIFTQB. VPERMW consumes only the low five index bits,
+  // and fp4_bf16 duplicates entries 0..15 at 16..31, so the adjacent nibble
+  // left in bit four does not need to be masked away. This replaces the
+  // separate low/high masks, unpack chain, and lane insertion used by the
+  // portable decoder.
   __attribute__((always_inline)) static inline __m512i
   mxfp4_to_bf16_32_vbmi(__m128i packed) {
     const __m256i source = _mm256_broadcastsi128_si256(packed);
@@ -421,9 +424,8 @@ struct GemmKernel224MXFP4SmallKGroup {
     const __m256i shifts = _mm256_setr_epi8(
         0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60,
         0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60);
-    const __m256i idx8 = _mm256_and_si256(
-        _mm256_multishift_epi64_epi8(shifts, duplicate_halves),
-        _mm256_set1_epi8(0x0F));
+    const __m256i idx8 =
+        _mm256_multishift_epi64_epi8(shifts, duplicate_halves);
     const __m512i idx16 = _mm512_cvtepu8_epi16(idx8);
     const __m512i lut = _mm512_load_si512(fp4_bf16);
     return _mm512_permutexvar_epi16(idx16, lut);
