@@ -557,33 +557,22 @@ class AMX_MOE_BASE {
 #endif
 
     int nth = T::recommended_nth(config_.intermediate_size);
-    bool gate_up_fused = false;
-    if constexpr (requires(Derived& backend) {
-                    backend.decode_gate_up_activation(0, 0);
-                  }) {
-      gate_up_fused =
-          derived()->decode_gate_up_activation(activated_expert, qlen);
-    }
-    if (!gate_up_fused) {
-      pool->do_work_stealing_job(
-          nth * activated_expert * 2, [](int _) { T::config(); },
-          [this, nth, qlen](int task_id2) {
-            int task_id = task_id2 / 2;
-            bool do_up = task_id2 % 2;
-            int expert_idx = m_expert_id_map_[task_id / nth];
+    pool->do_work_stealing_job(
+        nth * activated_expert * 2, [](int _) { T::config(); },
+        [this, nth, qlen](int task_id2) {
+          int task_id = task_id2 / 2;
+          bool do_up = task_id2 % 2;
+          int expert_idx = m_expert_id_map_[task_id / nth];
 
-            int ith = task_id % nth;
-            derived()->do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen);
-            if (do_up) {
-              up_bc_[expert_idx]->to_mat(
-                  qlen, m_local_up_output_ptr_[expert_idx], ith, nth);
-            } else {
-              gate_bc_[expert_idx]->to_mat(
-                  qlen, m_local_gate_output_ptr_[expert_idx], ith, nth);
-            }
-          },
-          nullptr);
-    }
+          int ith = task_id % nth;
+          derived()->do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen);
+          if (do_up) {
+            up_bc_[expert_idx]->to_mat(qlen, m_local_up_output_ptr_[expert_idx], ith, nth);
+          } else {
+            gate_bc_[expert_idx]->to_mat(qlen, m_local_gate_output_ptr_[expert_idx], ith, nth);
+          }
+        },
+        nullptr);
 
 #ifdef FORWARD_TIME_PROFILE
     {
@@ -593,7 +582,7 @@ class AMX_MOE_BASE {
     }
 #endif
 
-    if (!gate_up_fused) apply_activation(activated_expert, nth, qlen);
+    apply_activation(activated_expert, nth, qlen);
 
 #ifdef FORWARD_TIME_PROFILE
     {
@@ -603,16 +592,13 @@ class AMX_MOE_BASE {
     }
 #endif
 
-    if (!gate_up_fused) {
-      pool->do_work_stealing_job(
-          activated_expert, nullptr,
-          [this, qlen](int task_id) {
-            int expert_idx = m_expert_id_map_[task_id];
-            down_ba_[expert_idx]->from_mat(
-                qlen, m_local_gate_output_ptr_[expert_idx], 0, 1);
-          },
-          nullptr);
-    }
+    pool->do_work_stealing_job(
+        activated_expert, nullptr,
+        [this, qlen](int task_id) {
+          int expert_idx = m_expert_id_map_[task_id];
+          down_ba_[expert_idx]->from_mat(qlen, m_local_gate_output_ptr_[expert_idx], 0, 1);
+        },
+        nullptr);
 
 #ifdef FORWARD_TIME_PROFILE
     {
