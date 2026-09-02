@@ -91,6 +91,21 @@ inline bool use_nvfp4_bf16_scales() {
 #endif
 }
 
+inline bool use_nvfp4_vbmi_decode() {
+#if defined(__AVX512BF16__) && defined(__AVX512VBMI__) && \
+    defined(__AVX512VL__)
+  static const bool enabled = [] {
+    const char* value = std::getenv("KT_NVFP4_VBMI_DECODE");
+    if (value == nullptr || *value == '\0') return false;
+    return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+           std::strcmp(value, "false") != 0;
+  }();
+  return enabled;
+#else
+  return false;
+#endif
+}
+
 // Group-32 MXFP4 keeps the historical row-major representation. Native
 // group-16 NVFP4 is reordered into 16-output tiles so one DPBF16 vector
 // produces 16 output channels and their E4M3 scales can be applied together.
@@ -393,6 +408,43 @@ struct GemmKernel224MXFP4SmallKGroup {
     return _mm512_permutexvar_epi16(idx16, lut);
   }
 
+#if defined(__AVX512BF16__) && defined(__AVX512VBMI__) && \
+    defined(__AVX512VL__)
+  // Duplicate each packed 64-bit half, then extract its low and high eight
+  // nibbles with VPMULTISHIFTQB. This replaces the separate low/high masks,
+  // unpack chain, and lane insertion used by the portable decoder.
+  __attribute__((always_inline)) static inline __m512i
+  mxfp4_to_bf16_32_vbmi(__m128i packed) {
+    const __m256i source = _mm256_broadcastsi128_si256(packed);
+    const __m256i duplicate_halves = _mm256_permutexvar_epi64(
+        _mm256_setr_epi64x(0, 0, 1, 1), source);
+    const __m256i shifts = _mm256_setr_epi8(
+        0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60,
+        0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60);
+    const __m256i idx8 = _mm256_and_si256(
+        _mm256_multishift_epi64_epi8(shifts, duplicate_halves),
+        _mm256_set1_epi8(0x0F));
+    const __m512i idx16 = _mm512_cvtepu8_epi16(idx8);
+    const __m512i lut = _mm512_load_si512(fp4_bf16);
+    return _mm512_permutexvar_epi16(idx16, lut);
+  }
+#endif
+
+#if defined(__AVX512BF16__)
+  template <bool VBMI_DECODE>
+  __attribute__((always_inline)) static inline __m512bh
+  decode_nvfp4_weight(__m128i packed) {
+#if defined(__AVX512VBMI__) && defined(__AVX512VL__)
+    if constexpr (VBMI_DECODE) {
+      return (__m512bh)mxfp4_to_bf16_32_vbmi(packed);
+    }
+#else
+    static_assert(!VBMI_DECODE);
+#endif
+    return (__m512bh)mxfp4_to_bf16_32(packed);
+  }
+#endif
+
   struct ActivationBF16 {
     __m512bh a;
 #if !defined(__AVX512BF16__)
@@ -524,7 +576,7 @@ struct GemmKernel224MXFP4SmallKGroup {
   // Decode-oriented kernel. B is arranged as eight packed K-pairs across 16
   // output rows. DPBF16 therefore accumulates 16 independent output channels
   // and one scale vector handles the complete group-16 tile.
-  template <bool BF16_SCALE>
+  template <bool BF16_SCALE, bool VBMI_DECODE>
   static void fp4_mat_vec_nvfp4_blocked(int m, int n, int k, BufferA* ba,
                                         BufferB* bb, BufferC* bc, int ith,
                                         int nth) {
@@ -549,11 +601,11 @@ struct GemmKernel224MXFP4SmallKGroup {
 
 #define NVFP4_DP_PAIR(PAIR, ACC)                                                   \
   do {                                                                             \
-    const DequantizedWeight weight(                                                \
+    const __m512bh weight = decode_nvfp4_weight<VBMI_DECODE>(                     \
         _mm_loadu_si128(reinterpret_cast<const __m128i*>(weights + (PAIR) * 16))); \
     const ActivationBF16 activation(                                               \
         broadcast_bf16_pair(a_row + k_begin + (PAIR) * 2));                        \
-    (ACC) = _mm512_dpbf16_ps((ACC), activation.a, weight.d);                       \
+    (ACC) = _mm512_dpbf16_ps((ACC), activation.a, weight);                         \
   } while (0)
           NVFP4_DP_PAIR(0, partial0);
           NVFP4_DP_PAIR(1, partial1);
@@ -583,7 +635,7 @@ struct GemmKernel224MXFP4SmallKGroup {
   // activation pair, so its load and broadcast are paid once for 32 outputs.
   // Optional software prefetching is kept runtime-tunable because the useful
   // distance depends strongly on the CPU and memory topology.
-  template <bool BF16_SCALE>
+  template <bool BF16_SCALE, bool VBMI_DECODE>
   static void fp4_mat_vec_nvfp4_blocked_two_tiles(
       int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
       int nth) {
@@ -660,12 +712,12 @@ struct GemmKernel224MXFP4SmallKGroup {
   do {                                                                          \
     const ActivationBF16 activation(broadcast_bf16_pair(                       \
         a_row + group * BufferB::NVFP4_K_GROUP + (PAIR) * 2));                 \
-    const DequantizedWeight weight0(_mm_loadu_si128(                           \
+    const __m512bh weight0 = decode_nvfp4_weight<VBMI_DECODE>(_mm_loadu_si128( \
         reinterpret_cast<const __m128i*>(weights0 + (PAIR) * 16)));            \
-    const DequantizedWeight weight1(_mm_loadu_si128(                           \
+    const __m512bh weight1 = decode_nvfp4_weight<VBMI_DECODE>(_mm_loadu_si128( \
         reinterpret_cast<const __m128i*>(weights1 + (PAIR) * 16)));            \
-    (ACC0) = _mm512_dpbf16_ps((ACC0), activation.a, weight0.d);                \
-    (ACC1) = _mm512_dpbf16_ps((ACC1), activation.a, weight1.d);                \
+    (ACC0) = _mm512_dpbf16_ps((ACC0), activation.a, weight0);                  \
+    (ACC1) = _mm512_dpbf16_ps((ACC1), activation.a, weight1);                  \
   } while (0)
           NVFP4_DP_PAIR_TWO_TILES(0, partial00, partial10);
           NVFP4_DP_PAIR_TWO_TILES(1, partial01, partial11);
@@ -696,6 +748,31 @@ struct GemmKernel224MXFP4SmallKGroup {
         _mm512_storeu_ps(output + 16,
                          _mm512_mul_ps(total1, tensor_scale));
       }
+    }
+  }
+
+  template <bool BF16_SCALE>
+  static void fp4_mat_vec_nvfp4_blocked_dispatch(
+      int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
+      int nth) {
+#if defined(__AVX512VBMI__) && defined(__AVX512VL__)
+    if (use_nvfp4_vbmi_decode()) {
+      if (nvfp4_decode_tile_batch() == 2) {
+        fp4_mat_vec_nvfp4_blocked_two_tiles<BF16_SCALE, true>(
+            m, n, k, ba, bb, bc, ith, nth);
+      } else {
+        fp4_mat_vec_nvfp4_blocked<BF16_SCALE, true>(m, n, k, ba, bb, bc, ith,
+                                                    nth);
+      }
+      return;
+    }
+#endif
+    if (nvfp4_decode_tile_batch() == 2) {
+      fp4_mat_vec_nvfp4_blocked_two_tiles<BF16_SCALE, false>(
+          m, n, k, ba, bb, bc, ith, nth);
+    } else {
+      fp4_mat_vec_nvfp4_blocked<BF16_SCALE, false>(m, n, k, ba, bb, bc, ith,
+                                                   nth);
     }
   }
 #endif
@@ -783,19 +860,11 @@ struct GemmKernel224MXFP4SmallKGroup {
 #if defined(__AVX512BF16__)
     if (k_group_size == 16 && bb->blocked_nvfp4()) {
       if (bb->bf16_nvfp4_scales()) {
-        if (nvfp4_decode_tile_batch() == 2) {
-          fp4_mat_vec_nvfp4_blocked_two_tiles<true>(m, n, k, ba, bb, bc,
-                                                    ith, nth);
-        } else {
-          fp4_mat_vec_nvfp4_blocked<true>(m, n, k, ba, bb, bc, ith, nth);
-        }
+        fp4_mat_vec_nvfp4_blocked_dispatch<true>(m, n, k, ba, bb, bc, ith,
+                                                 nth);
       } else {
-        if (nvfp4_decode_tile_batch() == 2) {
-          fp4_mat_vec_nvfp4_blocked_two_tiles<false>(m, n, k, ba, bb, bc,
-                                                     ith, nth);
-        } else {
-          fp4_mat_vec_nvfp4_blocked<false>(m, n, k, ba, bb, bc, ith, nth);
-        }
+        fp4_mat_vec_nvfp4_blocked_dispatch<false>(m, n, k, ba, bb, bc, ith,
+                                                  nth);
       }
       return;
     }
@@ -947,19 +1016,11 @@ struct GemmKernel224MXFP4SmallKGroup {
 #if defined(__AVX512BF16__)
     if (k_group_size == 16 && bb->blocked_nvfp4()) {
       if (bb->bf16_nvfp4_scales()) {
-        if (nvfp4_decode_tile_batch() == 2) {
-          fp4_mat_vec_nvfp4_blocked_two_tiles<true>(m, n, k, ba, bb, bc,
-                                                    ith, nth);
-        } else {
-          fp4_mat_vec_nvfp4_blocked<true>(m, n, k, ba, bb, bc, ith, nth);
-        }
+        fp4_mat_vec_nvfp4_blocked_dispatch<true>(m, n, k, ba, bb, bc, ith,
+                                                 nth);
       } else {
-        if (nvfp4_decode_tile_batch() == 2) {
-          fp4_mat_vec_nvfp4_blocked_two_tiles<false>(m, n, k, ba, bb, bc,
-                                                     ith, nth);
-        } else {
-          fp4_mat_vec_nvfp4_blocked<false>(m, n, k, ba, bb, bc, ith, nth);
-        }
+        fp4_mat_vec_nvfp4_blocked_dispatch<false>(m, n, k, ba, bb, bc, ith,
+                                                  nth);
       }
       return;
     }
@@ -1032,9 +1093,12 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
                                     : (blocked && amx::use_nvfp4_bf16_scales()
                                            ? "bf16"
                                            : "e4m3");
+    const char* weight_decode =
+        blocked && amx::use_nvfp4_vbmi_decode() ? "vbmi" : "unpack";
     printf(
         "Creating AMX_FP4_MOE_TP %d at numa %d (layout=%s, decode_tiles=%d, "
-        "prefetch_groups=%d, n_block=%d, scale_storage=%s)\n",
+        "prefetch_groups=%d, n_block=%d, scale_storage=%s, "
+        "weight_decode=%s)\n",
         tp_part_idx, numa_node_of_cpu(sched_getcpu()), layout,
         blocked ? amx::nvfp4_decode_tile_batch() : 1,
         blocked && amx::nvfp4_decode_tile_batch() == 2
@@ -1042,7 +1106,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
             : 0,
         blocked ? amx::nvfp4_n_block()
                 : amx::GemmKernel224MXFP4SmallKGroup::N_BLOCK,
-        scale_storage);
+        scale_storage, weight_decode);
   }
 
   ~AMX_FP4_MOE_TP() = default;
