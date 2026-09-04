@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import os
 import statistics
 import time
 from pathlib import Path
@@ -326,18 +327,29 @@ def benchmark_native_forward(
     seconds_per_forward = statistics.median(samples)
     projection_elements = 3 * hidden_size * intermediate_size
     checkpoint_bytes = projection_elements * (0.5 + 1.0 / 16.0)
+    bf16_scales = os.getenv("KT_NVFP4_BF16_SCALES", "").lower() not in (
+        "",
+        "0",
+        "off",
+        "false",
+    )
+    resident_bytes = projection_elements * (
+        0.5 + (2.0 if bf16_scales else 1.0) / 16.0
+    )
     effective_gbps = (
         checkpoint_bytes * cpu_top_k / seconds_per_forward / 1e9
     )
+    resident_gbps = resident_bytes * cpu_top_k / seconds_per_forward / 1e9
     benchmark_kind = "LLC-hot" if expert_count == 1 else "rotating"
-    working_set_gb = checkpoint_bytes * expert_count / 1e9
+    working_set_gb = resident_bytes * expert_count / 1e9
     print(
         f"  benchmark ({benchmark_kind}, experts={expert_count}, "
         f"route_top_k={top_k}, cpu_top_k={cpu_top_k}, "
         f"weight_working_set={working_set_gb:.3f} GB): "
         f"{seconds_per_forward * 1e3:.3f} ms/forward "
         f"{1.0 / seconds_per_forward:.3f} forwards/s "
-        f"{effective_gbps:.3f} effective_weight_GB/s"
+        f"{effective_gbps:.3f} checkpoint_weight_GB/s "
+        f"{resident_gbps:.3f} resident_weight_GB/s"
     )
     if repeats > 1:
         sample_ms = ", ".join(f"{sample * 1e3:.3f}" for sample in samples)
