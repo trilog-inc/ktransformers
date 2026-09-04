@@ -64,47 +64,6 @@ inline int nvfp4_prefetch_groups() {
 #endif
 }
 
-enum class NVFP4ScalePrefetchMode {
-  kOff,
-  kDedup,
-  kAll,
-};
-
-inline NVFP4ScalePrefetchMode nvfp4_scale_prefetch_mode() {
-#if defined(__AVX512BF16__)
-  static const NVFP4ScalePrefetchMode mode = [] {
-    const char* value = std::getenv("KT_NVFP4_SCALE_PREFETCH");
-    if (value == nullptr || *value == '\0' || std::strcmp(value, "all") == 0 ||
-        std::strcmp(value, "1") == 0) {
-      return NVFP4ScalePrefetchMode::kAll;
-    }
-    if (std::strcmp(value, "dedup") == 0 || std::strcmp(value, "once") == 0) {
-      return NVFP4ScalePrefetchMode::kDedup;
-    }
-    if (std::strcmp(value, "0") == 0 || std::strcmp(value, "off") == 0 ||
-        std::strcmp(value, "false") == 0) {
-      return NVFP4ScalePrefetchMode::kOff;
-    }
-    return NVFP4ScalePrefetchMode::kAll;
-  }();
-  return mode;
-#else
-  return NVFP4ScalePrefetchMode::kOff;
-#endif
-}
-
-inline const char* nvfp4_scale_prefetch_name() {
-  switch (nvfp4_scale_prefetch_mode()) {
-    case NVFP4ScalePrefetchMode::kOff:
-      return "off";
-    case NVFP4ScalePrefetchMode::kDedup:
-      return "dedup";
-    case NVFP4ScalePrefetchMode::kAll:
-      return "all";
-  }
-  return "off";
-}
-
 inline int nvfp4_n_block() {
 #if defined(__AVX512BF16__)
   static const int block = [] {
@@ -610,17 +569,6 @@ struct GemmKernel224MXFP4SmallKGroup {
     return e4m3fnx16_to_fp32(packed);
   }
 
-  template <size_t SCALE_GROUP_BYTES, NVFP4ScalePrefetchMode MODE>
-  __attribute__((always_inline)) static inline bool should_prefetch_scale(
-      int group, int future_group) {
-    static_assert(SCALE_GROUP_BYTES > 0 && SCALE_GROUP_BYTES <= 64);
-    static_assert(64 % SCALE_GROUP_BYTES == 0);
-    if constexpr (MODE == NVFP4ScalePrefetchMode::kOff) return false;
-    if constexpr (MODE == NVFP4ScalePrefetchMode::kAll) return true;
-    constexpr int GROUPS_PER_CACHE_LINE = 64 / SCALE_GROUP_BYTES;
-    return group == 0 || future_group % GROUPS_PER_CACHE_LINE == 0;
-  }
-
   __attribute__((always_inline)) static inline __m512bh broadcast_bf16_pair(
       const ggml_bf16_t* values) {
     uint32_t pair;
@@ -809,8 +757,7 @@ struct GemmKernel224MXFP4SmallKGroup {
   // Process four adjacent output tiles while sharing each activation
   // broadcast across 64 output channels. This is useful on CPUs with enough
   // vector registers and memory-level parallelism to sustain the wider tile.
-  template <bool BF16_SCALE, bool VBMI_DECODE,
-            NVFP4ScalePrefetchMode SCALE_PREFETCH>
+  template <bool BF16_SCALE, bool VBMI_DECODE>
   static void fp4_mat_vec_nvfp4_blocked_four_tiles(
       int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
       int nth) {
@@ -885,21 +832,18 @@ struct GemmKernel224MXFP4SmallKGroup {
             NVFP4_PREFETCH_WEIGHT_TILE(future_weights2);
             NVFP4_PREFETCH_WEIGHT_TILE(future_weights3);
 #undef NVFP4_PREFETCH_WEIGHT_TILE
-            if (should_prefetch_scale<SCALE_GROUP_BYTES, SCALE_PREFETCH>(
-                    group, future_group)) {
-              _mm_prefetch(reinterpret_cast<const char*>(scale_base0 +
-                                                         future_scale_offset),
-                           _MM_HINT_T0);
-              _mm_prefetch(reinterpret_cast<const char*>(scale_base1 +
-                                                         future_scale_offset),
-                           _MM_HINT_T0);
-              _mm_prefetch(reinterpret_cast<const char*>(scale_base2 +
-                                                         future_scale_offset),
-                           _MM_HINT_T0);
-              _mm_prefetch(reinterpret_cast<const char*>(scale_base3 +
-                                                         future_scale_offset),
-                           _MM_HINT_T0);
-            }
+            _mm_prefetch(reinterpret_cast<const char*>(scale_base0 +
+                                                       future_scale_offset),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(scale_base1 +
+                                                       future_scale_offset),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(scale_base2 +
+                                                       future_scale_offset),
+                         _MM_HINT_T0);
+            _mm_prefetch(reinterpret_cast<const char*>(scale_base3 +
+                                                       future_scale_offset),
+                         _MM_HINT_T0);
           }
 
           __m512 group_sum0 = _mm512_setzero_ps();
@@ -968,29 +912,6 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
   }
 
-  template <bool BF16_SCALE, bool VBMI_DECODE>
-  static void fp4_mat_vec_nvfp4_blocked_four_tiles_dispatch(
-      int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
-      int nth) {
-    switch (nvfp4_scale_prefetch_mode()) {
-      case NVFP4ScalePrefetchMode::kOff:
-        fp4_mat_vec_nvfp4_blocked_four_tiles<
-            BF16_SCALE, VBMI_DECODE, NVFP4ScalePrefetchMode::kOff>(
-            m, n, k, ba, bb, bc, ith, nth);
-        return;
-      case NVFP4ScalePrefetchMode::kDedup:
-        fp4_mat_vec_nvfp4_blocked_four_tiles<
-            BF16_SCALE, VBMI_DECODE, NVFP4ScalePrefetchMode::kDedup>(
-            m, n, k, ba, bb, bc, ith, nth);
-        return;
-      case NVFP4ScalePrefetchMode::kAll:
-        fp4_mat_vec_nvfp4_blocked_four_tiles<
-            BF16_SCALE, VBMI_DECODE, NVFP4ScalePrefetchMode::kAll>(
-            m, n, k, ba, bb, bc, ith, nth);
-        return;
-    }
-  }
-
   template <bool BF16_SCALE>
   static void fp4_mat_vec_nvfp4_blocked_dispatch(
       int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
@@ -1001,7 +922,7 @@ struct GemmKernel224MXFP4SmallKGroup {
 #if defined(__AVX512VBMI__) && defined(__AVX512VL__)
     if (use_nvfp4_vbmi_decode()) {
       if (use_four_tiles) {
-        fp4_mat_vec_nvfp4_blocked_four_tiles_dispatch<BF16_SCALE, true>(
+        fp4_mat_vec_nvfp4_blocked_four_tiles<BF16_SCALE, true>(
             m, n, k, ba, bb, bc, ith, nth);
       } else if (nvfp4_decode_tile_batch() == 2) {
         fp4_mat_vec_nvfp4_blocked_two_tiles<BF16_SCALE, true>(
@@ -1014,7 +935,7 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
 #endif
     if (use_four_tiles) {
-      fp4_mat_vec_nvfp4_blocked_four_tiles_dispatch<BF16_SCALE, false>(
+      fp4_mat_vec_nvfp4_blocked_four_tiles<BF16_SCALE, false>(
           m, n, k, ba, bb, bc, ith, nth);
     } else if (nvfp4_decode_tile_batch() == 2) {
       fp4_mat_vec_nvfp4_blocked_two_tiles<BF16_SCALE, false>(
@@ -1347,7 +1268,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     printf(
         "Creating AMX_FP4_MOE_TP %d at numa %d (layout=%s, decode_tiles=%d, "
         "prefetch_groups=%d, n_block=%d, scale_storage=%s, "
-        "weight_decode=%s, scale_prefetch=%s)\n",
+        "weight_decode=%s)\n",
         tp_part_idx, numa_node_of_cpu(sched_getcpu()), layout,
         blocked ? amx::nvfp4_decode_tile_batch() : 1,
         blocked && amx::nvfp4_decode_tile_batch() > 1
@@ -1355,10 +1276,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
             : 0,
         blocked ? amx::nvfp4_n_block()
                 : amx::GemmKernel224MXFP4SmallKGroup::N_BLOCK,
-        scale_storage, weight_decode,
-        blocked && amx::nvfp4_decode_tile_batch() > 1
-            ? amx::nvfp4_scale_prefetch_name()
-            : "off");
+        scale_storage, weight_decode);
   }
 
   ~AMX_FP4_MOE_TP() = default;
