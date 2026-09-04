@@ -1318,10 +1318,14 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
                                            : "e4m3");
     const char* weight_decode =
         blocked && amx::use_nvfp4_vbmi_decode() ? "vbmi" : "unpack";
+    const bool direct_bf16_output = use_direct_bf16_output();
+    const bool fused_down_reduce =
+        direct_bf16_output && this->use_nvfp4_fused_down_reduce();
     printf(
         "Creating AMX_FP4_MOE_TP %d at numa %d (layout=%s, decode_tiles=%d, "
         "prefetch_groups=%d, n_block=%d, scale_storage=%s, "
-        "weight_decode=%s, direct_down_input=%d, direct_bf16_output=%d)\n",
+        "weight_decode=%s, direct_down_input=%d, direct_bf16_output=%d, "
+        "fused_down_reduce=%d)\n",
         tp_part_idx, numa_node_of_cpu(sched_getcpu()), layout,
         blocked ? amx::nvfp4_decode_tile_batch() : 1,
         blocked && amx::nvfp4_decode_tile_batch() > 1
@@ -1331,7 +1335,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
                 : amx::GemmKernel224MXFP4SmallKGroup::N_BLOCK,
         scale_storage, weight_decode,
         this->use_nvfp4_direct_down_input() ? 1 : 0,
-        use_direct_bf16_output() ? 1 : 0);
+        direct_bf16_output ? 1 : 0, fused_down_reduce ? 1 : 0);
   }
 
   ~AMX_FP4_MOE_TP() = default;
