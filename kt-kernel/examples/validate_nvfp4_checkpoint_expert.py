@@ -119,13 +119,10 @@ def load_checkpoint_experts(args: argparse.Namespace):
         raise ValueError(
             "--benchmark-cpu-top-k must be between 0 and --benchmark-top-k"
         )
-    if (
-        args.benchmark_cpu_top_k > 0
-        and args.benchmark_expert_count % args.benchmark_cpu_top_k
-    ):
+    if args.benchmark_cpu_top_k > args.benchmark_expert_count:
         raise ValueError(
-            "--benchmark-expert-count must be divisible by "
-            "--benchmark-cpu-top-k"
+            "--benchmark-cpu-top-k must not exceed "
+            "--benchmark-expert-count"
         )
     expert_ids = list(
         range(args.expert, args.expert + args.benchmark_expert_count)
@@ -291,12 +288,21 @@ def benchmark_native_forward(
     output = torch.empty_like(inputs)
     batch_size = torch.ones(1, dtype=torch.int32)
     expert_ids = []
-    route_starts = range(0, expert_count, cpu_top_k) if cpu_top_k else (0,)
+    if not cpu_top_k:
+        route_starts = (0,)
+    elif expert_count % cpu_top_k == 0:
+        route_starts = range(0, expert_count, cpu_top_k)
+    else:
+        route_starts = range(expert_count)
     for start in route_starts:
         route = torch.full((1, top_k), -1, dtype=torch.int64)
         if cpu_top_k:
-            route[0, :cpu_top_k] = torch.arange(
-                start, start + cpu_top_k, dtype=torch.int64
+            route[0, :cpu_top_k] = torch.tensor(
+                [
+                    (start + offset) % expert_count
+                    for offset in range(cpu_top_k)
+                ],
+                dtype=torch.int64,
             )
         expert_ids.append(route)
     routing_weights = torch.zeros((1, top_k), dtype=torch.float32)

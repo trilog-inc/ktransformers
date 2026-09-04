@@ -572,22 +572,31 @@ class AMX_MOE_BASE {
 
     const bool direct_bf16_output = derived()->use_direct_bf16_output();
     int nth = T::recommended_nth(config_.intermediate_size);
+    const int task_grain = nvfp4_decode_task_grain();
+    const int gate_up_task_count = nth * activated_expert * 2;
     pool->do_work_stealing_job(
-        nth * activated_expert * 2, [](int _) { T::config(); },
-        [this, nth, qlen, direct_bf16_output](int task_id2) {
-          int task_id = task_id2 / 2;
-          bool do_up = task_id2 % 2;
-          int expert_idx = m_expert_id_map_[task_id / nth];
+        (gate_up_task_count + task_grain - 1) / task_grain,
+        [](int _) { T::config(); },
+        [this, nth, qlen, direct_bf16_output, task_grain,
+         gate_up_task_count](int grouped_task_id) {
+          const int task_begin = grouped_task_id * task_grain;
+          const int task_end =
+              std::min(task_begin + task_grain, gate_up_task_count);
+          for (int task_id2 = task_begin; task_id2 < task_end; ++task_id2) {
+            int task_id = task_id2 / 2;
+            bool do_up = task_id2 % 2;
+            int expert_idx = m_expert_id_map_[task_id / nth];
 
-          int ith = task_id % nth;
-          derived()->do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen);
-          if (!direct_bf16_output) {
-            if (do_up) {
-              up_bc_[expert_idx]->to_mat(
-                  qlen, m_local_up_output_ptr_[expert_idx], ith, nth);
-            } else {
-              gate_bc_[expert_idx]->to_mat(
-                  qlen, m_local_gate_output_ptr_[expert_idx], ith, nth);
+            int ith = task_id % nth;
+            derived()->do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen);
+            if (!direct_bf16_output) {
+              if (do_up) {
+                up_bc_[expert_idx]->to_mat(
+                    qlen, m_local_up_output_ptr_[expert_idx], ith, nth);
+              } else {
+                gate_bc_[expert_idx]->to_mat(
+                    qlen, m_local_gate_output_ptr_[expert_idx], ith, nth);
+              }
             }
           }
         },
@@ -637,15 +646,23 @@ class AMX_MOE_BASE {
 #endif
 
     nth = T::recommended_nth(config_.hidden_size);
+    const int down_task_count = nth * activated_expert;
     pool->do_work_stealing_job(
-        nth * activated_expert, [](int _) { T::config(); },
-        [this, nth, qlen, direct_bf16_output](int task_id) {
-          int expert_idx = m_expert_id_map_[task_id / nth];
-          int ith = task_id % nth;
-          derived()->do_down_gemm(expert_idx, ith, nth, qlen);
-          if (!direct_bf16_output) {
-            down_bc_[expert_idx]->to_mat(
-                qlen, m_local_down_output_ptr_[expert_idx], ith, nth);
+        (down_task_count + task_grain - 1) / task_grain,
+        [](int _) { T::config(); },
+        [this, nth, qlen, direct_bf16_output, task_grain,
+         down_task_count](int grouped_task_id) {
+          const int task_begin = grouped_task_id * task_grain;
+          const int task_end =
+              std::min(task_begin + task_grain, down_task_count);
+          for (int task_id = task_begin; task_id < task_end; ++task_id) {
+            int expert_idx = m_expert_id_map_[task_id / nth];
+            int ith = task_id % nth;
+            derived()->do_down_gemm(expert_idx, ith, nth, qlen);
+            if (!direct_bf16_output) {
+              down_bc_[expert_idx]->to_mat(
+                  qlen, m_local_down_output_ptr_[expert_idx], ith, nth);
+            }
           }
         },
         nullptr);
@@ -711,6 +728,19 @@ class AMX_MOE_BASE {
   }
 
   bool use_direct_bf16_output() const { return false; }
+
+  int nvfp4_decode_task_grain() const {
+    if (config_.quant_config.quant_method != "NVFP4") {
+      return 1;
+    }
+    static const int grain = [] {
+      const char* value = std::getenv("KT_NVFP4_TASK_GRAIN");
+      if (value == nullptr || *value == '\0') return 1;
+      const int parsed = std::atoi(value);
+      return parsed == 1 || parsed == 2 || parsed == 4 ? parsed : 1;
+    }();
+    return grain;
+  }
 
  protected:
   Derived* derived() { return static_cast<Derived*>(this); }
