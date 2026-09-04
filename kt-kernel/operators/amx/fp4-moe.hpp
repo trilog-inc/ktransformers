@@ -107,6 +107,20 @@ inline bool use_nvfp4_vbmi_decode() {
 #endif
 }
 
+inline bool use_nvfp4_direct_bf16_output() {
+#if defined(__AVX512BF16__)
+  static const bool enabled = [] {
+    const char* value = std::getenv("KT_NVFP4_DIRECT_BF16_OUTPUT");
+    if (value == nullptr || *value == '\0') return false;
+    return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+           std::strcmp(value, "false") != 0;
+  }();
+  return enabled;
+#else
+  return false;
+#endif
+}
+
 // Group-32 MXFP4 keeps the historical row-major representation. Native
 // group-16 NVFP4 is reordered into 16-output tiles so one DPBF16 vector
 // produces 16 output channels and their E4M3 scales can be applied together.
@@ -582,7 +596,8 @@ struct GemmKernel224MXFP4SmallKGroup {
   template <bool BF16_SCALE, bool VBMI_DECODE>
   static void fp4_mat_vec_nvfp4_blocked(int m, int n, int k, BufferA* ba,
                                         BufferB* bb, BufferC* bc, int ith,
-                                        int nth) {
+                                        int nth,
+                                        ggml_bf16_t* direct_output) {
     auto [n_start, n_end] = split_range_n(n, ith, nth);
     if (n_start >= n_end) return;
     if (k > K_BLOCK) {
@@ -628,8 +643,17 @@ struct GemmKernel224MXFP4SmallKGroup {
           total = _mm512_fmadd_ps(group_sum, scales, total);
         }
 
-        float* output = bc->get_submat(m, n, m_idx, n_pos);
-        _mm512_storeu_ps(output, _mm512_mul_ps(total, tensor_scale));
+        const __m512 result = _mm512_mul_ps(total, tensor_scale);
+        if (direct_output != nullptr) {
+          const __m256bh packed = _mm512_cvtneps_pbh(result);
+          _mm256_storeu_si256(
+              reinterpret_cast<__m256i*>(direct_output + (size_t)m_idx * n +
+                                         n_pos),
+              (__m256i)packed);
+        } else {
+          float* output = bc->get_submat(m, n, m_idx, n_pos);
+          _mm512_storeu_ps(output, result);
+        }
       }
     }
   }
@@ -641,7 +665,7 @@ struct GemmKernel224MXFP4SmallKGroup {
   template <bool BF16_SCALE, bool VBMI_DECODE>
   static void fp4_mat_vec_nvfp4_blocked_two_tiles(
       int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
-      int nth) {
+      int nth, ggml_bf16_t* direct_output) {
     auto [n_start, n_end] = split_range_n(n, ith, nth);
     if (n_start >= n_end) return;
     if (k > K_BLOCK) {
@@ -746,10 +770,18 @@ struct GemmKernel224MXFP4SmallKGroup {
           total1 = _mm512_fmadd_ps(group_sum1, scales1, total1);
         }
 
-        float* output = bc->get_submat(m, n, m_idx, n_pos);
-        _mm512_storeu_ps(output, _mm512_mul_ps(total0, tensor_scale));
-        _mm512_storeu_ps(output + 16,
-                         _mm512_mul_ps(total1, tensor_scale));
+        __m512 result0 = _mm512_mul_ps(total0, tensor_scale);
+        __m512 result1 = _mm512_mul_ps(total1, tensor_scale);
+        if (direct_output != nullptr) {
+          avx512_32xfp32_to_32xbf16(
+              &result0, &result1,
+              reinterpret_cast<__m512i*>(direct_output +
+                                          (size_t)m_idx * n + n_pos));
+        } else {
+          float* output = bc->get_submat(m, n, m_idx, n_pos);
+          _mm512_storeu_ps(output, result0);
+          _mm512_storeu_ps(output + 16, result1);
+        }
       }
     }
   }
@@ -760,7 +792,7 @@ struct GemmKernel224MXFP4SmallKGroup {
   template <bool BF16_SCALE, bool VBMI_DECODE>
   static void fp4_mat_vec_nvfp4_blocked_four_tiles(
       int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
-      int nth) {
+      int nth, ggml_bf16_t* direct_output) {
     auto [n_start, n_end] = split_range_n(n, ith, nth);
     if (n_start >= n_end) return;
     if (k > K_BLOCK) {
@@ -900,14 +932,25 @@ struct GemmKernel224MXFP4SmallKGroup {
           total3 = _mm512_fmadd_ps(group_sum3, scales3, total3);
         }
 
-        float* output = bc->get_submat(m, n, m_idx, n_pos);
-        _mm512_storeu_ps(output, _mm512_mul_ps(total0, tensor_scale));
-        _mm512_storeu_ps(output + 16,
-                         _mm512_mul_ps(total1, tensor_scale));
-        _mm512_storeu_ps(output + 32,
-                         _mm512_mul_ps(total2, tensor_scale));
-        _mm512_storeu_ps(output + 48,
-                         _mm512_mul_ps(total3, tensor_scale));
+        __m512 result0 = _mm512_mul_ps(total0, tensor_scale);
+        __m512 result1 = _mm512_mul_ps(total1, tensor_scale);
+        __m512 result2 = _mm512_mul_ps(total2, tensor_scale);
+        __m512 result3 = _mm512_mul_ps(total3, tensor_scale);
+        if (direct_output != nullptr) {
+          ggml_bf16_t* output =
+              direct_output + (size_t)m_idx * n + n_pos;
+          avx512_32xfp32_to_32xbf16(
+              &result0, &result1, reinterpret_cast<__m512i*>(output));
+          avx512_32xfp32_to_32xbf16(
+              &result2, &result3,
+              reinterpret_cast<__m512i*>(output + 32));
+        } else {
+          float* output = bc->get_submat(m, n, m_idx, n_pos);
+          _mm512_storeu_ps(output, result0);
+          _mm512_storeu_ps(output + 16, result1);
+          _mm512_storeu_ps(output + 32, result2);
+          _mm512_storeu_ps(output + 48, result3);
+        }
       }
     }
   }
@@ -915,7 +958,7 @@ struct GemmKernel224MXFP4SmallKGroup {
   template <bool BF16_SCALE>
   static void fp4_mat_vec_nvfp4_blocked_dispatch(
       int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
-      int nth) {
+      int nth, ggml_bf16_t* direct_output = nullptr) {
     const auto [n_start, n_end] = split_range_n(n, ith, nth);
     const bool use_four_tiles = nvfp4_decode_tile_batch() == 4 &&
                                 (n_end - n_start) % 64 == 0;
@@ -923,26 +966,26 @@ struct GemmKernel224MXFP4SmallKGroup {
     if (use_nvfp4_vbmi_decode()) {
       if (use_four_tiles) {
         fp4_mat_vec_nvfp4_blocked_four_tiles<BF16_SCALE, true>(
-            m, n, k, ba, bb, bc, ith, nth);
+            m, n, k, ba, bb, bc, ith, nth, direct_output);
       } else if (nvfp4_decode_tile_batch() == 2) {
         fp4_mat_vec_nvfp4_blocked_two_tiles<BF16_SCALE, true>(
-            m, n, k, ba, bb, bc, ith, nth);
+            m, n, k, ba, bb, bc, ith, nth, direct_output);
       } else {
         fp4_mat_vec_nvfp4_blocked<BF16_SCALE, true>(m, n, k, ba, bb, bc, ith,
-                                                    nth);
+                                                    nth, direct_output);
       }
       return;
     }
 #endif
     if (use_four_tiles) {
       fp4_mat_vec_nvfp4_blocked_four_tiles<BF16_SCALE, false>(
-          m, n, k, ba, bb, bc, ith, nth);
+          m, n, k, ba, bb, bc, ith, nth, direct_output);
     } else if (nvfp4_decode_tile_batch() == 2) {
       fp4_mat_vec_nvfp4_blocked_two_tiles<BF16_SCALE, false>(
-          m, n, k, ba, bb, bc, ith, nth);
+          m, n, k, ba, bb, bc, ith, nth, direct_output);
     } else {
       fp4_mat_vec_nvfp4_blocked<BF16_SCALE, false>(m, n, k, ba, bb, bc, ith,
-                                                   nth);
+                                                   nth, direct_output);
     }
   }
 #endif
@@ -1025,20 +1068,23 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
   }
 
-  static void fp4_mat_vec_kgroup(int m, int n, int k, int k_group_size, BufferA* ba, BufferB* bb, BufferC* bc, int ith,
-                                 int nth) {
+  static void fp4_mat_vec_kgroup(int m, int n, int k, int k_group_size,
+                                 BufferA* ba, BufferB* bb, BufferC* bc,
+                                 int ith, int nth,
+                                 ggml_bf16_t* direct_output = nullptr) {
 #if defined(__AVX512BF16__)
     if (k_group_size == 16 && bb->blocked_nvfp4()) {
       if (bb->bf16_nvfp4_scales()) {
         fp4_mat_vec_nvfp4_blocked_dispatch<true>(m, n, k, ba, bb, bc, ith,
-                                                 nth);
+                                                 nth, direct_output);
       } else {
         fp4_mat_vec_nvfp4_blocked_dispatch<false>(m, n, k, ba, bb, bc, ith,
-                                                  nth);
+                                                  nth, direct_output);
       }
       return;
     }
 #endif
+    assert(direct_output == nullptr);
     if (k_group_size == 16) {
       fp4_mat_vec_kgroup_impl<16>(m, n, k, ba, bb, bc, ith, nth);
     } else if (k_group_size == 32) {
@@ -1209,8 +1255,12 @@ struct GemmKernel224MXFP4SmallKGroup {
 inline void vec_mul_kgroup(int m, int n, int k, int k_group_size,
                            std::shared_ptr<GemmKernel224MXFP4SmallKGroup::BufferA> ba,
                            std::shared_ptr<GemmKernel224MXFP4SmallKGroup::BufferB> bb,
-                           std::shared_ptr<GemmKernel224MXFP4SmallKGroup::BufferC> bc, int ith, int nth) {
-  GemmKernel224MXFP4SmallKGroup::fp4_mat_vec_kgroup(m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith, nth);
+                           std::shared_ptr<GemmKernel224MXFP4SmallKGroup::BufferC> bc,
+                           int ith, int nth,
+                           ggml_bf16_t* direct_output = nullptr) {
+  GemmKernel224MXFP4SmallKGroup::fp4_mat_vec_kgroup(
+      m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith, nth,
+      direct_output);
 }
 
 inline void mat_mul_kgroup(int m, int n, int k, int k_group_size,
@@ -1235,7 +1285,10 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
   using Base::gate_bb_;
   using Base::gate_bc_;
   using Base::gate_up_ba_;
+  using Base::m_local_down_output_ptr_;
+  using Base::m_local_gate_output_ptr_;
   using Base::m_local_num_;
+  using Base::m_local_up_output_ptr_;
   using Base::tp_part_idx;
   using Base::up_bb_;
   using Base::up_bc_;
@@ -1268,7 +1321,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     printf(
         "Creating AMX_FP4_MOE_TP %d at numa %d (layout=%s, decode_tiles=%d, "
         "prefetch_groups=%d, n_block=%d, scale_storage=%s, "
-        "weight_decode=%s, direct_down_input=%d)\n",
+        "weight_decode=%s, direct_down_input=%d, direct_bf16_output=%d)\n",
         tp_part_idx, numa_node_of_cpu(sched_getcpu()), layout,
         blocked ? amx::nvfp4_decode_tile_batch() : 1,
         blocked && amx::nvfp4_decode_tile_batch() > 1
@@ -1277,10 +1330,18 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
         blocked ? amx::nvfp4_n_block()
                 : amx::GemmKernel224MXFP4SmallKGroup::N_BLOCK,
         scale_storage, weight_decode,
-        this->use_nvfp4_direct_down_input() ? 1 : 0);
+        this->use_nvfp4_direct_down_input() ? 1 : 0,
+        use_direct_bf16_output() ? 1 : 0);
   }
 
   ~AMX_FP4_MOE_TP() = default;
+
+  bool use_direct_bf16_output() const {
+    return config_.quant_config.quant_method == "NVFP4" &&
+           config_.quant_config.group_size == 16 &&
+           amx::use_nvfp4_blocked_layout() &&
+           amx::use_nvfp4_direct_bf16_output();
+  }
 
   // BufferA: raw BF16, no group_size needed
   size_t buffer_a_required_size_impl(size_t m, size_t k) const { return T::BufferA::required_size(m, k); }
@@ -1309,7 +1370,14 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
       amx::mat_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
     } else {
-      amx::vec_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
+      ggml_bf16_t* direct_output =
+          qlen == 1 && use_direct_bf16_output()
+              ? (do_up ? m_local_up_output_ptr_[expert_idx]
+                       : m_local_gate_output_ptr_[expert_idx])
+              : nullptr;
+      amx::vec_mul_kgroup(m, config_.intermediate_size,
+                          config_.hidden_size, group_size, ba, bb, bc, ith,
+                          nth, direct_output);
     }
   }
 
@@ -1321,8 +1389,14 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
       amx::mat_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
                           down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
     } else {
-      amx::vec_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
-                          down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
+      ggml_bf16_t* direct_output =
+          qlen == 1 && use_direct_bf16_output()
+              ? m_local_down_output_ptr_[expert_idx]
+              : nullptr;
+      amx::vec_mul_kgroup(
+          m, config_.hidden_size, config_.intermediate_size, group_size,
+          down_ba_[expert_idx], down_bb_[expert_idx], down_bc_[expert_idx],
+          ith, nth, direct_output);
     }
   }
 

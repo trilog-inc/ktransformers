@@ -570,20 +570,25 @@ class AMX_MOE_BASE {
     }
 #endif
 
+    const bool direct_bf16_output = derived()->use_direct_bf16_output();
     int nth = T::recommended_nth(config_.intermediate_size);
     pool->do_work_stealing_job(
         nth * activated_expert * 2, [](int _) { T::config(); },
-        [this, nth, qlen](int task_id2) {
+        [this, nth, qlen, direct_bf16_output](int task_id2) {
           int task_id = task_id2 / 2;
           bool do_up = task_id2 % 2;
           int expert_idx = m_expert_id_map_[task_id / nth];
 
           int ith = task_id % nth;
           derived()->do_gate_up_gemm(do_up, expert_idx, ith, nth, qlen);
-          if (do_up) {
-            up_bc_[expert_idx]->to_mat(qlen, m_local_up_output_ptr_[expert_idx], ith, nth);
-          } else {
-            gate_bc_[expert_idx]->to_mat(qlen, m_local_gate_output_ptr_[expert_idx], ith, nth);
+          if (!direct_bf16_output) {
+            if (do_up) {
+              up_bc_[expert_idx]->to_mat(
+                  qlen, m_local_up_output_ptr_[expert_idx], ith, nth);
+            } else {
+              gate_bc_[expert_idx]->to_mat(
+                  qlen, m_local_gate_output_ptr_[expert_idx], ith, nth);
+            }
           }
         },
         nullptr);
@@ -634,11 +639,14 @@ class AMX_MOE_BASE {
     nth = T::recommended_nth(config_.hidden_size);
     pool->do_work_stealing_job(
         nth * activated_expert, [](int _) { T::config(); },
-        [this, nth, qlen](int task_id) {
+        [this, nth, qlen, direct_bf16_output](int task_id) {
           int expert_idx = m_expert_id_map_[task_id / nth];
           int ith = task_id % nth;
           derived()->do_down_gemm(expert_idx, ith, nth, qlen);
-          down_bc_[expert_idx]->to_mat(qlen, m_local_down_output_ptr_[expert_idx], ith, nth);
+          if (!direct_bf16_output) {
+            down_bc_[expert_idx]->to_mat(
+                qlen, m_local_down_output_ptr_[expert_idx], ith, nth);
+          }
         },
         nullptr);
 
@@ -701,6 +709,8 @@ class AMX_MOE_BASE {
     }();
     return enabled;
   }
+
+  bool use_direct_bf16_output() const { return false; }
 
  protected:
   Derived* derived() { return static_cast<Derived*>(this); }
