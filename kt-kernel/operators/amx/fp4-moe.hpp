@@ -135,6 +135,20 @@ inline bool use_nvfp4_interleaved_layout() {
 #endif
 }
 
+inline bool use_nvfp4_quartet_layout() {
+#if defined(__AVX512BF16__)
+  static const bool enabled = [] {
+    const char* value = std::getenv("KT_NVFP4_QUARTET_LAYOUT");
+    if (value == nullptr || *value == '\0') return false;
+    return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+           std::strcmp(value, "false") != 0;
+  }();
+  return enabled;
+#else
+  return false;
+#endif
+}
+
 // Group-32 MXFP4 keeps the historical row-major representation. Native
 // group-16 NVFP4 is reordered into 16-output tiles so one DPBF16 vector
 // produces 16 output channels and their E4M3 scales can be applied together.
@@ -143,6 +157,8 @@ inline bool use_nvfp4_interleaved_layout() {
 // bytes per parameter to remove E4M3 conversion from the decode inner loop.
 // The interleaved layout keeps that footprint while placing each tile's scales
 // immediately after its packed weights to reduce independent memory streams.
+// The quartet layout instead follows the four-tile decode loop: each cache line
+// contains one K-pair for 64 outputs, followed by those four tiles' scales.
 template <typename K>
 struct BufferBMXFP4KGroupImpl {
   using dt = typename K::dt;
@@ -155,6 +171,9 @@ struct BufferBMXFP4KGroupImpl {
   static constexpr int N_BLOCK = K::N_BLOCK;
   static constexpr int NVFP4_N_TILE = 16;
   static constexpr int NVFP4_K_GROUP = 16;
+  static constexpr int NVFP4_QUARTET_TILES = 4;
+  static constexpr int NVFP4_QUARTET_N =
+      NVFP4_N_TILE * NVFP4_QUARTET_TILES;
 
   static size_t required_size(int n, int k, int k_group_size) {
     const size_t weight_bytes = (size_t)n * k / 2;
@@ -178,6 +197,10 @@ struct BufferBMXFP4KGroupImpl {
     }
     b = reinterpret_cast<dt*>(ptr);
     d = reinterpret_cast<float*>(offset_pointer(b, (size_t)n * k / 2));
+    if (quartet_nvfp4() && n % NVFP4_QUARTET_N != 0) {
+      throw std::runtime_error(
+          "NVFP4 quartet layout requires n to be divisible by 64");
+    }
   }
 
   bool blocked_nvfp4() const {
@@ -189,7 +212,12 @@ struct BufferBMXFP4KGroupImpl {
   }
 
   bool interleaved_nvfp4() const {
-    return blocked_nvfp4() && use_nvfp4_interleaved_layout();
+    return blocked_nvfp4() && use_nvfp4_interleaved_layout() &&
+           !use_nvfp4_quartet_layout();
+  }
+
+  bool quartet_nvfp4() const {
+    return blocked_nvfp4() && use_nvfp4_quartet_layout();
   }
 
   size_t nvfp4_scale_element_bytes() const {
@@ -199,6 +227,28 @@ struct BufferBMXFP4KGroupImpl {
   size_t nvfp4_tile_group_bytes() const {
     return (size_t)NVFP4_N_TILE * NVFP4_K_GROUP / 2 +
            (size_t)NVFP4_N_TILE * nvfp4_scale_element_bytes();
+  }
+
+  size_t nvfp4_scale_tile_bytes() const {
+    return (size_t)NVFP4_N_TILE * nvfp4_scale_element_bytes();
+  }
+
+  size_t nvfp4_quartet_group_bytes() const {
+    return (size_t)NVFP4_QUARTET_TILES *
+           ((size_t)NVFP4_N_TILE * NVFP4_K_GROUP / 2 +
+            nvfp4_scale_tile_bytes());
+  }
+
+  size_t nvfp4_quartet_group_offset(int n_begin,
+                                     int k_group_begin) const {
+    const int quartet_begin =
+        n_begin / NVFP4_QUARTET_N * NVFP4_QUARTET_N;
+    const int k_group = k_group_begin / NVFP4_K_GROUP;
+    const size_t row_bytes = (size_t)k / 2 +
+                             (size_t)k_group_count *
+                                 nvfp4_scale_element_bytes();
+    return (size_t)quartet_begin * row_bytes +
+           (size_t)k_group * nvfp4_quartet_group_bytes();
   }
 
   size_t nvfp4_interleaved_tile_offset(int n_begin,
@@ -216,15 +266,23 @@ struct BufferBMXFP4KGroupImpl {
   }
 
   size_t nvfp4_weight_group_stride_bytes() const {
+    if (quartet_nvfp4()) return nvfp4_quartet_group_bytes();
     return interleaved_nvfp4()
                ? nvfp4_tile_group_bytes()
                : (size_t)NVFP4_N_TILE * NVFP4_K_GROUP / 2;
   }
 
   size_t nvfp4_scale_group_stride_bytes() const {
+    if (quartet_nvfp4()) return nvfp4_quartet_group_bytes();
     return interleaved_nvfp4()
                ? nvfp4_tile_group_bytes()
                : (size_t)NVFP4_N_TILE * nvfp4_scale_element_bytes();
+  }
+
+  size_t nvfp4_weight_pair_stride_bytes() const {
+    return quartet_nvfp4()
+               ? (size_t)NVFP4_N_TILE / 2 * NVFP4_QUARTET_TILES
+               : (size_t)NVFP4_N_TILE;
   }
 
   static std::pair<int, int> split_rows(int n, int ith, int nth) {
@@ -265,6 +323,13 @@ struct BufferBMXFP4KGroupImpl {
   }
 
   const uint8_t* get_nvfp4_weight_tile(int n_begin, int k_group_begin) const {
+    if (quartet_nvfp4()) {
+      const int tile =
+          (n_begin % NVFP4_QUARTET_N) / NVFP4_N_TILE;
+      return reinterpret_cast<const uint8_t*>(b) +
+             nvfp4_quartet_group_offset(n_begin, k_group_begin) +
+             (size_t)tile * NVFP4_N_TILE;
+    }
     if (interleaved_nvfp4()) {
       return reinterpret_cast<const uint8_t*>(b) +
              nvfp4_interleaved_tile_offset(n_begin, k_group_begin);
@@ -274,6 +339,13 @@ struct BufferBMXFP4KGroupImpl {
   }
 
   uint8_t* get_nvfp4_weight_tile(int n_begin, int k_group_begin) {
+    if (quartet_nvfp4()) {
+      const int tile =
+          (n_begin % NVFP4_QUARTET_N) / NVFP4_N_TILE;
+      return reinterpret_cast<uint8_t*>(b) +
+             nvfp4_quartet_group_offset(n_begin, k_group_begin) +
+             (size_t)tile * NVFP4_N_TILE;
+    }
     if (interleaved_nvfp4()) {
       return reinterpret_cast<uint8_t*>(b) +
              nvfp4_interleaved_tile_offset(n_begin, k_group_begin);
@@ -283,6 +355,15 @@ struct BufferBMXFP4KGroupImpl {
   }
 
   const uint8_t* get_nvfp4_scale_tile(int n_begin, int k_group_begin) const {
+    if (quartet_nvfp4()) {
+      const int tile =
+          (n_begin % NVFP4_QUARTET_N) / NVFP4_N_TILE;
+      return reinterpret_cast<const uint8_t*>(b) +
+             nvfp4_quartet_group_offset(n_begin, k_group_begin) +
+             (size_t)NVFP4_QUARTET_TILES * NVFP4_N_TILE *
+                 NVFP4_K_GROUP / 2 +
+             (size_t)tile * nvfp4_scale_tile_bytes();
+    }
     if (interleaved_nvfp4()) {
       return reinterpret_cast<const uint8_t*>(b) +
              nvfp4_interleaved_tile_offset(n_begin, k_group_begin) +
@@ -293,6 +374,15 @@ struct BufferBMXFP4KGroupImpl {
   }
 
   uint8_t* get_nvfp4_scale_tile(int n_begin, int k_group_begin) {
+    if (quartet_nvfp4()) {
+      const int tile =
+          (n_begin % NVFP4_QUARTET_N) / NVFP4_N_TILE;
+      return reinterpret_cast<uint8_t*>(b) +
+             nvfp4_quartet_group_offset(n_begin, k_group_begin) +
+             (size_t)NVFP4_QUARTET_TILES * NVFP4_N_TILE *
+                 NVFP4_K_GROUP / 2 +
+             (size_t)tile * nvfp4_scale_tile_bytes();
+    }
     if (interleaved_nvfp4()) {
       return reinterpret_cast<uint8_t*>(b) +
              nvfp4_interleaved_tile_offset(n_begin, k_group_begin) +
@@ -302,10 +392,12 @@ struct BufferBMXFP4KGroupImpl {
            nvfp4_scale_tile_byte_offset(n_begin, k_group_begin);
   }
 
-  // Transpose 16 output rows x 8 packed K-pair bytes into eight contiguous
-  // 16-byte vectors. This is the exact layout consumed by the decode kernel.
+  // Transpose 16 output rows x 8 packed K-pair bytes into eight 16-byte
+  // vectors. pair_stride is 16 for tile-major storage and 64 when four tiles
+  // share each cache line in quartet storage.
   static void transpose_nvfp4_weight_tile(const uint8_t* src,
-                                           size_t row_stride, uint8_t* dst) {
+                                           size_t row_stride, uint8_t* dst,
+                                           size_t pair_stride) {
     __m128i rows[16];
     for (int row = 0; row < 16; ++row) {
       rows[row] = _mm_loadl_epi64(
@@ -339,21 +431,21 @@ struct BufferBMXFP4KGroupImpl {
     const __m128i c6 = _mm_unpacklo_epi32(b5, b7);
     const __m128i c7 = _mm_unpackhi_epi32(b5, b7);
 
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 0 * 16),
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 0 * pair_stride),
                      _mm_unpacklo_epi64(c0, c4));
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 1 * 16),
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 1 * pair_stride),
                      _mm_unpackhi_epi64(c0, c4));
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 2 * 16),
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 2 * pair_stride),
                      _mm_unpacklo_epi64(c1, c5));
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 3 * 16),
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 3 * pair_stride),
                      _mm_unpackhi_epi64(c1, c5));
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 4 * 16),
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 4 * pair_stride),
                      _mm_unpacklo_epi64(c2, c6));
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 5 * 16),
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 5 * pair_stride),
                      _mm_unpackhi_epi64(c2, c6));
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 6 * 16),
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 6 * pair_stride),
                      _mm_unpacklo_epi64(c3, c7));
-    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 7 * 16),
+    _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + 7 * pair_stride),
                      _mm_unpackhi_epi64(c3, c7));
   }
 
@@ -384,7 +476,8 @@ struct BufferBMXFP4KGroupImpl {
         uint8_t* weight_tile = get_nvfp4_weight_tile(n_begin, k_begin);
         transpose_nvfp4_weight_tile(
             weights + (size_t)n_begin * weight_row_stride + k_begin / 2,
-            weight_row_stride, weight_tile);
+            weight_row_stride, weight_tile,
+            nvfp4_weight_pair_stride_bytes());
         if (scales != nullptr) {
           uint8_t* scale_tile = get_nvfp4_scale_tile(n_begin, k_begin);
           const int group = k_begin / NVFP4_K_GROUP;
@@ -677,6 +770,8 @@ struct GemmKernel224MXFP4SmallKGroup {
       throw std::runtime_error("Blocked NVFP4 kernel requires k <= K_BLOCK");
     }
 
+    const size_t weight_pair_stride =
+        bb->nvfp4_weight_pair_stride_bytes();
     const __m512 tensor_scale = _mm512_set1_ps(bb->tensor_scale);
     for (int m_idx = 0; m_idx < m; ++m_idx) {
       const ggml_bf16_t* a_row = ba->get_submat(m, k, m_idx, 0);
@@ -693,7 +788,8 @@ struct GemmKernel224MXFP4SmallKGroup {
 #define NVFP4_DP_PAIR(PAIR, ACC)                                                   \
   do {                                                                             \
     const __m512bh weight = decode_nvfp4_weight<VBMI_DECODE>(                     \
-        _mm_loadu_si128(reinterpret_cast<const __m128i*>(weights + (PAIR) * 16))); \
+        _mm_loadu_si128(reinterpret_cast<const __m128i*>(                         \
+            weights + (PAIR) * weight_pair_stride)));                            \
     const ActivationBF16 activation(                                               \
         broadcast_bf16_pair(a_row + k_begin + (PAIR) * 2));                        \
     (ACC) = _mm512_dpbf16_ps((ACC), activation.a, weight);                         \
@@ -750,6 +846,9 @@ struct GemmKernel224MXFP4SmallKGroup {
         bb->nvfp4_weight_group_stride_bytes();
     const size_t scale_group_stride =
         bb->nvfp4_scale_group_stride_bytes();
+    const size_t weight_pair_stride =
+        bb->nvfp4_weight_pair_stride_bytes();
+    const bool quartet_layout = bb->quartet_nvfp4();
     const int group_count = k / BufferB::NVFP4_K_GROUP;
     const int prefetch_groups = nvfp4_prefetch_groups();
     const __m512 tensor_scale = _mm512_set1_ps(bb->tensor_scale);
@@ -782,20 +881,32 @@ struct GemmKernel224MXFP4SmallKGroup {
                 weight_base0 + future_weight_offset;
             const uint8_t* future_weights1 =
                 weight_base1 + future_weight_offset;
-            _mm_prefetch(reinterpret_cast<const char*>(future_weights0),
-                         _MM_HINT_T0);
-            _mm_prefetch(reinterpret_cast<const char*>(future_weights0 + 64),
-                         _MM_HINT_T0);
-            _mm_prefetch(reinterpret_cast<const char*>(future_weights1),
-                         _MM_HINT_T0);
-            _mm_prefetch(reinterpret_cast<const char*>(future_weights1 + 64),
-                         _MM_HINT_T0);
-            _mm_prefetch(reinterpret_cast<const char*>(scale_base0 +
-                                                       future_scale_offset),
-                         _MM_HINT_T0);
-            _mm_prefetch(reinterpret_cast<const char*>(scale_base1 +
-                                                       future_scale_offset),
-                         _MM_HINT_T0);
+            if (quartet_layout) {
+              for (int pair = 0; pair < 8; ++pair) {
+                _mm_prefetch(reinterpret_cast<const char*>(
+                                 future_weights0 +
+                                 (size_t)pair * weight_pair_stride),
+                             _MM_HINT_T0);
+              }
+              _mm_prefetch(reinterpret_cast<const char*>(scale_base0 +
+                                                         future_scale_offset),
+                           _MM_HINT_T0);
+            } else {
+              _mm_prefetch(reinterpret_cast<const char*>(future_weights0),
+                           _MM_HINT_T0);
+              _mm_prefetch(reinterpret_cast<const char*>(future_weights0 + 64),
+                           _MM_HINT_T0);
+              _mm_prefetch(reinterpret_cast<const char*>(future_weights1),
+                           _MM_HINT_T0);
+              _mm_prefetch(reinterpret_cast<const char*>(future_weights1 + 64),
+                           _MM_HINT_T0);
+              _mm_prefetch(reinterpret_cast<const char*>(scale_base0 +
+                                                         future_scale_offset),
+                           _MM_HINT_T0);
+              _mm_prefetch(reinterpret_cast<const char*>(scale_base1 +
+                                                         future_scale_offset),
+                           _MM_HINT_T0);
+            }
           }
 
           __m512 partial00 = _mm512_setzero_ps();
@@ -812,9 +923,11 @@ struct GemmKernel224MXFP4SmallKGroup {
     const ActivationBF16 activation(broadcast_bf16_pair(                       \
         a_row + group * BufferB::NVFP4_K_GROUP + (PAIR) * 2));                 \
     const __m512bh weight0 = decode_nvfp4_weight<VBMI_DECODE>(_mm_loadu_si128( \
-        reinterpret_cast<const __m128i*>(weights0 + (PAIR) * 16)));            \
+        reinterpret_cast<const __m128i*>(                                     \
+            weights0 + (PAIR) * weight_pair_stride)));                        \
     const __m512bh weight1 = decode_nvfp4_weight<VBMI_DECODE>(_mm_loadu_si128( \
-        reinterpret_cast<const __m128i*>(weights1 + (PAIR) * 16)));            \
+        reinterpret_cast<const __m128i*>(                                     \
+            weights1 + (PAIR) * weight_pair_stride)));                        \
     (ACC0) = _mm512_dpbf16_ps((ACC0), activation.a, weight0);                  \
     (ACC1) = _mm512_dpbf16_ps((ACC1), activation.a, weight1);                  \
   } while (0)
@@ -876,6 +989,11 @@ struct GemmKernel224MXFP4SmallKGroup {
         bb->nvfp4_weight_group_stride_bytes();
     const size_t scale_group_stride =
         bb->nvfp4_scale_group_stride_bytes();
+    const size_t weight_pair_stride =
+        bb->nvfp4_weight_pair_stride_bytes();
+    const bool quartet_layout = bb->quartet_nvfp4();
+    const size_t quartet_scale_bytes =
+        BufferB::NVFP4_QUARTET_TILES * bb->nvfp4_scale_tile_bytes();
     const int group_count = k / BufferB::NVFP4_K_GROUP;
     const int prefetch_groups = nvfp4_prefetch_groups();
     const __m512 tensor_scale = _mm512_set1_ps(bb->tensor_scale);
@@ -924,29 +1042,46 @@ struct GemmKernel224MXFP4SmallKGroup {
                 weight_base2 + future_weight_offset;
             const uint8_t* future_weights3 =
                 weight_base3 + future_weight_offset;
+            if (quartet_layout) {
+              for (int pair = 0; pair < 8; ++pair) {
+                _mm_prefetch(reinterpret_cast<const char*>(
+                                 future_weights0 +
+                                 (size_t)pair * weight_pair_stride),
+                             _MM_HINT_T0);
+              }
+              const uint8_t* future_scales =
+                  scale_base0 + future_scale_offset;
+              for (size_t offset = 0; offset < quartet_scale_bytes;
+                   offset += 64) {
+                _mm_prefetch(reinterpret_cast<const char*>(future_scales +
+                                                           offset),
+                             _MM_HINT_T0);
+              }
+            } else {
 #define NVFP4_PREFETCH_WEIGHT_TILE(PTR)                            \
   do {                                                            \
     _mm_prefetch(reinterpret_cast<const char*>(PTR), _MM_HINT_T0); \
     _mm_prefetch(reinterpret_cast<const char*>((PTR) + 64),        \
                  _MM_HINT_T0);                                    \
   } while (0)
-            NVFP4_PREFETCH_WEIGHT_TILE(future_weights0);
-            NVFP4_PREFETCH_WEIGHT_TILE(future_weights1);
-            NVFP4_PREFETCH_WEIGHT_TILE(future_weights2);
-            NVFP4_PREFETCH_WEIGHT_TILE(future_weights3);
+              NVFP4_PREFETCH_WEIGHT_TILE(future_weights0);
+              NVFP4_PREFETCH_WEIGHT_TILE(future_weights1);
+              NVFP4_PREFETCH_WEIGHT_TILE(future_weights2);
+              NVFP4_PREFETCH_WEIGHT_TILE(future_weights3);
 #undef NVFP4_PREFETCH_WEIGHT_TILE
-            _mm_prefetch(reinterpret_cast<const char*>(scale_base0 +
-                                                       future_scale_offset),
-                         _MM_HINT_T0);
-            _mm_prefetch(reinterpret_cast<const char*>(scale_base1 +
-                                                       future_scale_offset),
-                         _MM_HINT_T0);
-            _mm_prefetch(reinterpret_cast<const char*>(scale_base2 +
-                                                       future_scale_offset),
-                         _MM_HINT_T0);
-            _mm_prefetch(reinterpret_cast<const char*>(scale_base3 +
-                                                       future_scale_offset),
-                         _MM_HINT_T0);
+              _mm_prefetch(reinterpret_cast<const char*>(scale_base0 +
+                                                         future_scale_offset),
+                           _MM_HINT_T0);
+              _mm_prefetch(reinterpret_cast<const char*>(scale_base1 +
+                                                         future_scale_offset),
+                           _MM_HINT_T0);
+              _mm_prefetch(reinterpret_cast<const char*>(scale_base2 +
+                                                         future_scale_offset),
+                           _MM_HINT_T0);
+              _mm_prefetch(reinterpret_cast<const char*>(scale_base3 +
+                                                         future_scale_offset),
+                           _MM_HINT_T0);
+            }
           }
 
           __m512 group_sum0 = _mm512_setzero_ps();
@@ -959,13 +1094,17 @@ struct GemmKernel224MXFP4SmallKGroup {
     const ActivationBF16 activation(broadcast_bf16_pair(                      \
         a_row + group * BufferB::NVFP4_K_GROUP + (PAIR) * 2));                \
     const __m512bh weight0 = decode_nvfp4_weight<VBMI_DECODE>(_mm_loadu_si128(\
-        reinterpret_cast<const __m128i*>(weights0 + (PAIR) * 16)));           \
+        reinterpret_cast<const __m128i*>(                                    \
+            weights0 + (PAIR) * weight_pair_stride)));                       \
     const __m512bh weight1 = decode_nvfp4_weight<VBMI_DECODE>(_mm_loadu_si128(\
-        reinterpret_cast<const __m128i*>(weights1 + (PAIR) * 16)));           \
+        reinterpret_cast<const __m128i*>(                                    \
+            weights1 + (PAIR) * weight_pair_stride)));                       \
     const __m512bh weight2 = decode_nvfp4_weight<VBMI_DECODE>(_mm_loadu_si128(\
-        reinterpret_cast<const __m128i*>(weights2 + (PAIR) * 16)));           \
+        reinterpret_cast<const __m128i*>(                                    \
+            weights2 + (PAIR) * weight_pair_stride)));                       \
     const __m512bh weight3 = decode_nvfp4_weight<VBMI_DECODE>(_mm_loadu_si128(\
-        reinterpret_cast<const __m128i*>(weights3 + (PAIR) * 16)));           \
+        reinterpret_cast<const __m128i*>(                                    \
+            weights3 + (PAIR) * weight_pair_stride)));                       \
     (ACC0) = _mm512_dpbf16_ps((ACC0), activation.a, weight0);                 \
     (ACC1) = _mm512_dpbf16_ps((ACC1), activation.a, weight1);                 \
     (ACC2) = _mm512_dpbf16_ps((ACC2), activation.a, weight2);                 \
@@ -1381,11 +1520,14 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     }
     const bool blocked =
         quant_config.group_size == 16 && amx::use_nvfp4_blocked_layout();
-    const char* layout = !blocked
-                             ? "row-major"
-                             : (amx::use_nvfp4_interleaved_layout()
-                                    ? "blocked-n16-interleaved"
-                                    : "blocked-n16");
+    const char* layout =
+        !blocked
+            ? "row-major"
+            : (amx::use_nvfp4_quartet_layout()
+                   ? "blocked-n64-group-major"
+                   : (amx::use_nvfp4_interleaved_layout()
+                          ? "blocked-n16-interleaved"
+                          : "blocked-n16"));
     const char* scale_storage = quant_config.group_size != 16
                                     ? "fp32"
                                     : (blocked && amx::use_nvfp4_bf16_scales()
