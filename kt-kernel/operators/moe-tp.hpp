@@ -5,6 +5,8 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <functional>
 #include <memory>
@@ -208,6 +210,24 @@ class TP_MOE_Common : public MoE_Interface {
 #endif
     int qlen = *qlen_ptr;
 
+    if (qlen == 1 && config.quant_config.quant_method == "NVFP4" &&
+        use_nvfp4_zero_cpu_fastpath()) {
+      bool has_cpu_expert = false;
+      for (int i = 0; i < k; ++i) {
+        if (!config.should_skip_expert(expert_ids[i])) {
+          has_cpu_expert = true;
+          break;
+        }
+      }
+      if (!has_cpu_expert) {
+        if (!incremental) {
+          std::memset(output, 0,
+                      sizeof(input_t) * (size_t)config.hidden_size);
+        }
+        return;
+      }
+    }
+
     auto pool = config.pool;
     pool->dispense_backend()->do_numa_job([this, pool, qlen, k, expert_ids, input, weights](int numa_id) {
       tps[numa_id]->forward(qlen, k, expert_ids, weights, input, this->local_output_numa[numa_id]);
@@ -243,6 +263,16 @@ class TP_MOE_Common : public MoE_Interface {
         forward_time, end.time_since_epoch().count() / 1000 % 100000000, band_width, average_bandwidth, GFLOPS,
         numa_node_of_cpu(sched_getcpu()));
 #endif
+  }
+
+  static bool use_nvfp4_zero_cpu_fastpath() {
+    static const bool enabled = [] {
+      const char* value = std::getenv("KT_NVFP4_ZERO_CPU_FASTPATH");
+      if (value == nullptr || *value == '\0') return false;
+      return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+             std::strcmp(value, "false") != 0;
+    }();
+    return enabled;
   }
 
   virtual void load_weights() = 0;

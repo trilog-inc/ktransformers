@@ -115,11 +115,14 @@ def load_checkpoint_experts(args: argparse.Namespace):
         raise ValueError("--benchmark-top-k must be at least 1")
     if args.benchmark_cpu_top_k is None:
         args.benchmark_cpu_top_k = args.benchmark_top_k
-    if not 1 <= args.benchmark_cpu_top_k <= args.benchmark_top_k:
+    if not 0 <= args.benchmark_cpu_top_k <= args.benchmark_top_k:
         raise ValueError(
-            "--benchmark-cpu-top-k must be between 1 and --benchmark-top-k"
+            "--benchmark-cpu-top-k must be between 0 and --benchmark-top-k"
         )
-    if args.benchmark_expert_count % args.benchmark_cpu_top_k:
+    if (
+        args.benchmark_cpu_top_k > 0
+        and args.benchmark_expert_count % args.benchmark_cpu_top_k
+    ):
         raise ValueError(
             "--benchmark-expert-count must be divisible by "
             "--benchmark-cpu-top-k"
@@ -288,14 +291,17 @@ def benchmark_native_forward(
     output = torch.empty_like(inputs)
     batch_size = torch.ones(1, dtype=torch.int32)
     expert_ids = []
-    for start in range(0, expert_count, cpu_top_k):
+    route_starts = range(0, expert_count, cpu_top_k) if cpu_top_k else (0,)
+    for start in route_starts:
         route = torch.full((1, top_k), -1, dtype=torch.int64)
-        route[0, :cpu_top_k] = torch.arange(
-            start, start + cpu_top_k, dtype=torch.int64
-        )
+        if cpu_top_k:
+            route[0, :cpu_top_k] = torch.arange(
+                start, start + cpu_top_k, dtype=torch.int64
+            )
         expert_ids.append(route)
     routing_weights = torch.zeros((1, top_k), dtype=torch.float32)
-    routing_weights[0, :cpu_top_k] = 1.0 / cpu_top_k
+    if cpu_top_k:
+        routing_weights[0, :cpu_top_k] = 1.0 / cpu_top_k
     route_count = len(expert_ids)
 
     def run_once(expert_index: int) -> None:
@@ -408,7 +414,7 @@ def main() -> None:
             cpu_infer,
             inputs,
             args.benchmark_top_k,
-            args.benchmark_cpu_top_k,
+            max(1, args.benchmark_cpu_top_k),
         )
         difference = (actual.float() - expected.float()).abs()
         relative_error = difference.mean().item() / (expected_mean + 1e-12)
