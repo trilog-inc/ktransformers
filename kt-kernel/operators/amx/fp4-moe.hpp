@@ -1268,7 +1268,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     printf(
         "Creating AMX_FP4_MOE_TP %d at numa %d (layout=%s, decode_tiles=%d, "
         "prefetch_groups=%d, n_block=%d, scale_storage=%s, "
-        "weight_decode=%s)\n",
+        "weight_decode=%s, direct_down_input=%d)\n",
         tp_part_idx, numa_node_of_cpu(sched_getcpu()), layout,
         blocked ? amx::nvfp4_decode_tile_batch() : 1,
         blocked && amx::nvfp4_decode_tile_batch() > 1
@@ -1276,7 +1276,8 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
             : 0,
         blocked ? amx::nvfp4_n_block()
                 : amx::GemmKernel224MXFP4SmallKGroup::N_BLOCK,
-        scale_storage, weight_decode);
+        scale_storage, weight_decode,
+        this->use_nvfp4_direct_down_input() ? 1 : 0);
   }
 
   ~AMX_FP4_MOE_TP() = default;

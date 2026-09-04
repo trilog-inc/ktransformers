@@ -20,6 +20,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -51,6 +52,7 @@ class AMX_MOE_BASE {
   std::vector<ggml_bf16_t*> m_local_input_ptr_;
   std::vector<ggml_bf16_t*> m_local_gate_output_ptr_;
   std::vector<ggml_bf16_t*> m_local_up_output_ptr_;
+  std::vector<ggml_bf16_t*> m_local_down_input_ptr_;
   std::vector<ggml_bf16_t*> m_local_down_output_ptr_;
 
   std::vector<std::shared_ptr<typename T::BufferA>> gate_up_ba_;
@@ -122,6 +124,7 @@ class AMX_MOE_BASE {
     m_local_input_ptr_.resize(config_.expert_num);
     m_local_gate_output_ptr_.resize(config_.expert_num);
     m_local_up_output_ptr_.resize(config_.expert_num);
+    m_local_down_input_ptr_.resize(config_.expert_num);
     m_local_down_output_ptr_.resize(config_.expert_num);
 
     for (size_t i = 0; i < config_.expert_num; i++) {
@@ -517,6 +520,8 @@ class AMX_MOE_BASE {
 
       down_ba_[expert_idx]->max_m = max_m;
       down_ba_[expert_idx]->set_data(down_ba_pool_ptr);
+      m_local_down_input_ptr_[expert_idx] = down_ba_[expert_idx]->get_submat(
+          qlen, config_.intermediate_size, 0, 0);
       size_t ba_down_size = align64(buffer_a_required_size(max_m, config_.intermediate_size));
       down_ba_pool_ptr = (void*)((uintptr_t)down_ba_pool_ptr + ba_down_size);
 
@@ -582,7 +587,13 @@ class AMX_MOE_BASE {
     }
 #endif
 
-    apply_activation(activated_expert, nth, qlen);
+    const bool direct_down_input = use_nvfp4_direct_down_input();
+    if (direct_down_input) {
+      apply_activation_to(activated_expert, nth, qlen,
+                          m_local_down_input_ptr_);
+    } else {
+      apply_activation(activated_expert, nth, qlen);
+    }
 
 #ifdef FORWARD_TIME_PROFILE
     {
@@ -592,13 +603,16 @@ class AMX_MOE_BASE {
     }
 #endif
 
-    pool->do_work_stealing_job(
-        activated_expert, nullptr,
-        [this, qlen](int task_id) {
-          int expert_idx = m_expert_id_map_[task_id];
-          down_ba_[expert_idx]->from_mat(qlen, m_local_gate_output_ptr_[expert_idx], 0, 1);
-        },
-        nullptr);
+    if (!direct_down_input) {
+      pool->do_work_stealing_job(
+          activated_expert, nullptr,
+          [this, qlen](int task_id) {
+            int expert_idx = m_expert_id_map_[task_id];
+            down_ba_[expert_idx]->from_mat(
+                qlen, m_local_gate_output_ptr_[expert_idx], 0, 1);
+          },
+          nullptr);
+    }
 
 #ifdef FORWARD_TIME_PROFILE
     {
@@ -661,6 +675,22 @@ class AMX_MOE_BASE {
         tp_part_idx, activated_expert, q_input_time, up_gate_time, act_time, q_down_time, down_time, weight_time,
         forward_total_time);
 #endif
+  }
+
+  bool use_nvfp4_direct_down_input() const {
+    if constexpr (T::M_STEP != 1) {
+      return false;
+    }
+    if (config_.quant_config.quant_method != "NVFP4") {
+      return false;
+    }
+    static const bool enabled = [] {
+      const char* value = std::getenv("KT_NVFP4_DIRECT_DOWN_INPUT");
+      if (value == nullptr || *value == '\0') return false;
+      return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+             std::strcmp(value, "false") != 0;
+    }();
+    return enabled;
   }
 
  protected:
