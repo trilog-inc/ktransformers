@@ -712,22 +712,6 @@ class AMX_MOE_BASE {
 
   bool use_direct_bf16_output() const { return false; }
 
-  bool use_nvfp4_parallel_activation() const {
-    if constexpr (T::M_STEP != 1) {
-      return false;
-    }
-    if (config_.quant_config.quant_method != "NVFP4") {
-      return false;
-    }
-    static const bool enabled = [] {
-      const char* value = std::getenv("KT_NVFP4_PARALLEL_ACTIVATION");
-      if (value == nullptr || *value == '\0') return false;
-      return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
-             std::strcmp(value, "false") != 0;
-    }();
-    return enabled;
-  }
-
  protected:
   Derived* derived() { return static_cast<Derived*>(this); }
   const Derived* derived_const() const { return static_cast<const Derived*>(this); }
@@ -791,7 +775,7 @@ class AMX_MOE_BASE {
       return;
     }
 
-    if (qlen < 10 && !use_nvfp4_parallel_activation()) {
+    if (qlen < 10) {
       for (int task_id = 0; task_id < nth * activated_expert; task_id++) {
         fn(task_id);
       }
