@@ -26,6 +26,7 @@
 #include <fstream>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -39,6 +40,11 @@
 template <class T, class Derived>
 class AMX_MOE_BASE {
  public:
+  using down_input_ptr_t = decltype(
+      std::declval<typename T::BufferA&>().get_submat(0, 0, 0, 0));
+  static constexpr bool HAS_BF16_DOWN_INPUT =
+      std::is_same_v<down_input_ptr_t, ggml_bf16_t*>;
+
   int tp_part_idx = 0;
 
   ggml_bf16_t* m_local_input_ = nullptr;
@@ -520,8 +526,11 @@ class AMX_MOE_BASE {
 
       down_ba_[expert_idx]->max_m = max_m;
       down_ba_[expert_idx]->set_data(down_ba_pool_ptr);
-      m_local_down_input_ptr_[expert_idx] = down_ba_[expert_idx]->get_submat(
-          qlen, config_.intermediate_size, 0, 0);
+      if constexpr (HAS_BF16_DOWN_INPUT) {
+        m_local_down_input_ptr_[expert_idx] =
+            down_ba_[expert_idx]->get_submat(
+                qlen, config_.intermediate_size, 0, 0);
+      }
       size_t ba_down_size = align64(buffer_a_required_size(max_m, config_.intermediate_size));
       down_ba_pool_ptr = (void*)((uintptr_t)down_ba_pool_ptr + ba_down_size);
 
@@ -678,7 +687,7 @@ class AMX_MOE_BASE {
   }
 
   bool use_nvfp4_direct_down_input() const {
-    if constexpr (T::M_STEP != 1) {
+    if constexpr (!HAS_BF16_DOWN_INPUT || T::M_STEP != 1) {
       return false;
     }
     if (config_.quant_config.quant_method != "NVFP4") {
