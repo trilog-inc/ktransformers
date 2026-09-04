@@ -121,12 +121,28 @@ inline bool use_nvfp4_direct_bf16_output() {
 #endif
 }
 
+inline bool use_nvfp4_interleaved_layout() {
+#if defined(__AVX512BF16__)
+  static const bool enabled = [] {
+    const char* value = std::getenv("KT_NVFP4_INTERLEAVED_LAYOUT");
+    if (value == nullptr || *value == '\0') return false;
+    return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+           std::strcmp(value, "false") != 0;
+  }();
+  return enabled;
+#else
+  return false;
+#endif
+}
+
 // Group-32 MXFP4 keeps the historical row-major representation. Native
 // group-16 NVFP4 is reordered into 16-output tiles so one DPBF16 vector
 // produces 16 output channels and their E4M3 scales can be applied together.
 // The packed weights and one-byte scales retain the checkpoint's 0.5625-byte
 // per-parameter footprint by default. An opt-in BF16 scale layout uses 0.625
 // bytes per parameter to remove E4M3 conversion from the decode inner loop.
+// The interleaved layout keeps that footprint while placing each tile's scales
+// immediately after its packed weights to reduce independent memory streams.
 template <typename K>
 struct BufferBMXFP4KGroupImpl {
   using dt = typename K::dt;
@@ -172,6 +188,45 @@ struct BufferBMXFP4KGroupImpl {
     return blocked_nvfp4() && use_nvfp4_bf16_scales();
   }
 
+  bool interleaved_nvfp4() const {
+    return blocked_nvfp4() && use_nvfp4_interleaved_layout();
+  }
+
+  size_t nvfp4_scale_element_bytes() const {
+    return bf16_nvfp4_scales() ? sizeof(ggml_bf16_t) : sizeof(uint8_t);
+  }
+
+  size_t nvfp4_tile_group_bytes() const {
+    return (size_t)NVFP4_N_TILE * NVFP4_K_GROUP / 2 +
+           (size_t)NVFP4_N_TILE * nvfp4_scale_element_bytes();
+  }
+
+  size_t nvfp4_interleaved_tile_offset(int n_begin,
+                                        int k_group_begin) const {
+    const int n_block = nvfp4_n_block();
+    const int n_block_begin = n_begin / n_block * n_block;
+    const int n_tile = (n_begin - n_block_begin) / NVFP4_N_TILE;
+    const int k_group = k_group_begin / NVFP4_K_GROUP;
+    const size_t row_bytes = (size_t)k / 2 +
+                             (size_t)k_group_count *
+                                 nvfp4_scale_element_bytes();
+    return (size_t)n_block_begin * row_bytes +
+           (size_t)n_tile * k_group_count * nvfp4_tile_group_bytes() +
+           (size_t)k_group * nvfp4_tile_group_bytes();
+  }
+
+  size_t nvfp4_weight_group_stride_bytes() const {
+    return interleaved_nvfp4()
+               ? nvfp4_tile_group_bytes()
+               : (size_t)NVFP4_N_TILE * NVFP4_K_GROUP / 2;
+  }
+
+  size_t nvfp4_scale_group_stride_bytes() const {
+    return interleaved_nvfp4()
+               ? nvfp4_tile_group_bytes()
+               : (size_t)NVFP4_N_TILE * nvfp4_scale_element_bytes();
+  }
+
   static std::pair<int, int> split_rows(int n, int ith, int nth) {
     const int n_block = nvfp4_n_block();
     const int block_count = (n + n_block - 1) / n_block;
@@ -210,21 +265,39 @@ struct BufferBMXFP4KGroupImpl {
   }
 
   const uint8_t* get_nvfp4_weight_tile(int n_begin, int k_group_begin) const {
+    if (interleaved_nvfp4()) {
+      return reinterpret_cast<const uint8_t*>(b) +
+             nvfp4_interleaved_tile_offset(n_begin, k_group_begin);
+    }
     return reinterpret_cast<const uint8_t*>(b) +
            nvfp4_weight_tile_offset(n_begin, k_group_begin);
   }
 
   uint8_t* get_nvfp4_weight_tile(int n_begin, int k_group_begin) {
+    if (interleaved_nvfp4()) {
+      return reinterpret_cast<uint8_t*>(b) +
+             nvfp4_interleaved_tile_offset(n_begin, k_group_begin);
+    }
     return reinterpret_cast<uint8_t*>(b) +
            nvfp4_weight_tile_offset(n_begin, k_group_begin);
   }
 
   const uint8_t* get_nvfp4_scale_tile(int n_begin, int k_group_begin) const {
+    if (interleaved_nvfp4()) {
+      return reinterpret_cast<const uint8_t*>(b) +
+             nvfp4_interleaved_tile_offset(n_begin, k_group_begin) +
+             (size_t)NVFP4_N_TILE * NVFP4_K_GROUP / 2;
+    }
     return reinterpret_cast<const uint8_t*>(d) +
            nvfp4_scale_tile_byte_offset(n_begin, k_group_begin);
   }
 
   uint8_t* get_nvfp4_scale_tile(int n_begin, int k_group_begin) {
+    if (interleaved_nvfp4()) {
+      return reinterpret_cast<uint8_t*>(b) +
+             nvfp4_interleaved_tile_offset(n_begin, k_group_begin) +
+             (size_t)NVFP4_N_TILE * NVFP4_K_GROUP / 2;
+    }
     return reinterpret_cast<uint8_t*>(d) +
            nvfp4_scale_tile_byte_offset(n_begin, k_group_begin);
   }
@@ -673,11 +746,10 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
     assert((n_end - n_start) % 32 == 0);
 
-    constexpr size_t WEIGHT_GROUP_BYTES =
-        BufferB::NVFP4_N_TILE * BufferB::NVFP4_K_GROUP / 2;
-    constexpr size_t SCALE_GROUP_BYTES =
-        BufferB::NVFP4_N_TILE *
-        (BF16_SCALE ? sizeof(ggml_bf16_t) : sizeof(uint8_t));
+    const size_t weight_group_stride =
+        bb->nvfp4_weight_group_stride_bytes();
+    const size_t scale_group_stride =
+        bb->nvfp4_scale_group_stride_bytes();
     const int group_count = k / BufferB::NVFP4_K_GROUP;
     const int prefetch_groups = nvfp4_prefetch_groups();
     const __m512 tensor_scale = _mm512_set1_ps(bb->tensor_scale);
@@ -695,17 +767,17 @@ struct GemmKernel224MXFP4SmallKGroup {
         __m512 total1 = _mm512_setzero_ps();
 
         for (int group = 0; group < group_count; ++group) {
-          const size_t weight_offset = (size_t)group * WEIGHT_GROUP_BYTES;
-          const size_t scale_offset = (size_t)group * SCALE_GROUP_BYTES;
+          const size_t weight_offset = (size_t)group * weight_group_stride;
+          const size_t scale_offset = (size_t)group * scale_group_stride;
           const uint8_t* weights0 = weight_base0 + weight_offset;
           const uint8_t* weights1 = weight_base1 + weight_offset;
 
           const int future_group = group + prefetch_groups;
           if (prefetch_groups > 0 && future_group < group_count) {
             const size_t future_weight_offset =
-                (size_t)future_group * WEIGHT_GROUP_BYTES;
+                (size_t)future_group * weight_group_stride;
             const size_t future_scale_offset =
-                (size_t)future_group * SCALE_GROUP_BYTES;
+                (size_t)future_group * scale_group_stride;
             const uint8_t* future_weights0 =
                 weight_base0 + future_weight_offset;
             const uint8_t* future_weights1 =
@@ -800,11 +872,10 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
     assert((n_end - n_start) % 64 == 0);
 
-    constexpr size_t WEIGHT_GROUP_BYTES =
-        BufferB::NVFP4_N_TILE * BufferB::NVFP4_K_GROUP / 2;
-    constexpr size_t SCALE_GROUP_BYTES =
-        BufferB::NVFP4_N_TILE *
-        (BF16_SCALE ? sizeof(ggml_bf16_t) : sizeof(uint8_t));
+    const size_t weight_group_stride =
+        bb->nvfp4_weight_group_stride_bytes();
+    const size_t scale_group_stride =
+        bb->nvfp4_scale_group_stride_bytes();
     const int group_count = k / BufferB::NVFP4_K_GROUP;
     const int prefetch_groups = nvfp4_prefetch_groups();
     const __m512 tensor_scale = _mm512_set1_ps(bb->tensor_scale);
@@ -832,8 +903,8 @@ struct GemmKernel224MXFP4SmallKGroup {
         __m512 total3 = _mm512_setzero_ps();
 
         for (int group = 0; group < group_count; ++group) {
-          const size_t weight_offset = (size_t)group * WEIGHT_GROUP_BYTES;
-          const size_t scale_offset = (size_t)group * SCALE_GROUP_BYTES;
+          const size_t weight_offset = (size_t)group * weight_group_stride;
+          const size_t scale_offset = (size_t)group * scale_group_stride;
           const uint8_t* weights0 = weight_base0 + weight_offset;
           const uint8_t* weights1 = weight_base1 + weight_offset;
           const uint8_t* weights2 = weight_base2 + weight_offset;
@@ -842,9 +913,9 @@ struct GemmKernel224MXFP4SmallKGroup {
           const int future_group = group + prefetch_groups;
           if (prefetch_groups > 0 && future_group < group_count) {
             const size_t future_weight_offset =
-                (size_t)future_group * WEIGHT_GROUP_BYTES;
+                (size_t)future_group * weight_group_stride;
             const size_t future_scale_offset =
-                (size_t)future_group * SCALE_GROUP_BYTES;
+                (size_t)future_group * scale_group_stride;
             const uint8_t* future_weights0 =
                 weight_base0 + future_weight_offset;
             const uint8_t* future_weights1 =
@@ -1310,7 +1381,11 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     }
     const bool blocked =
         quant_config.group_size == 16 && amx::use_nvfp4_blocked_layout();
-    const char* layout = blocked ? "blocked-n16" : "row-major";
+    const char* layout = !blocked
+                             ? "row-major"
+                             : (amx::use_nvfp4_interleaved_layout()
+                                    ? "blocked-n16-interleaved"
+                                    : "blocked-n16");
     const char* scale_storage = quant_config.group_size != 16
                                     ? "fp32"
                                     : (blocked && amx::use_nvfp4_bf16_scales()
