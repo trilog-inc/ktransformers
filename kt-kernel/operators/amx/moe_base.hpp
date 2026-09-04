@@ -637,57 +637,18 @@ class AMX_MOE_BASE {
 #endif
 
     nth = T::recommended_nth(config_.hidden_size);
-    const bool fused_down_reduce =
-        direct_bf16_output && use_nvfp4_fused_down_reduce();
-    if (fused_down_reduce) {
-      pool->do_work_stealing_job(
-          nth, [](int _) { T::config(); },
-          [this, nth, qlen, k, expert_ids, weights, output](int ith) {
-            for (int j = 0; j < k; j++) {
-              if (config_.should_skip_expert(expert_ids[j])) {
-                continue;
-              }
-              derived()->do_down_gemm(expert_ids[j], ith, nth, qlen);
-            }
-
-            auto [e_start, e_end] =
-                T::split_range_n(config_.hidden_size, ith, nth);
-            for (int e = e_start; e < e_end; e += 32) {
-              __m512 x0 = _mm512_setzero_ps();
-              __m512 x1 = _mm512_setzero_ps();
-              for (int j = 0; j < k; j++) {
-                if (config_.should_skip_expert(expert_ids[j])) {
-                  continue;
-                }
-                __m512 weight = _mm512_set1_ps(weights[j]);
-                __m512 down_output0, down_output1;
-                avx512_32xbf16_to_32xfp32(
-                    (__m512i*)(m_local_down_output_ptr_[expert_ids[j]] +
-                               m_local_pos_[0][j] * config_.hidden_size + e),
-                    &down_output0, &down_output1);
-                x0 = _mm512_fmadd_ps(down_output0, weight, x0);
-                x1 = _mm512_fmadd_ps(down_output1, weight, x1);
-              }
-              auto f32out = (__m512*)((float*)output + e);
-              f32out[0] = x0;
-              f32out[1] = x1;
-            }
-          },
-          nullptr);
-    } else {
-      pool->do_work_stealing_job(
-          nth * activated_expert, [](int _) { T::config(); },
-          [this, nth, qlen, direct_bf16_output](int task_id) {
-            int expert_idx = m_expert_id_map_[task_id / nth];
-            int ith = task_id % nth;
-            derived()->do_down_gemm(expert_idx, ith, nth, qlen);
-            if (!direct_bf16_output) {
-              down_bc_[expert_idx]->to_mat(
-                  qlen, m_local_down_output_ptr_[expert_idx], ith, nth);
-            }
-          },
-          nullptr);
-    }
+    pool->do_work_stealing_job(
+        nth * activated_expert, [](int _) { T::config(); },
+        [this, nth, qlen, direct_bf16_output](int task_id) {
+          int expert_idx = m_expert_id_map_[task_id / nth];
+          int ith = task_id % nth;
+          derived()->do_down_gemm(expert_idx, ith, nth, qlen);
+          if (!direct_bf16_output) {
+            down_bc_[expert_idx]->to_mat(
+                qlen, m_local_down_output_ptr_[expert_idx], ith, nth);
+          }
+        },
+        nullptr);
 
 #ifdef FORWARD_TIME_PROFILE
     {
@@ -697,27 +658,24 @@ class AMX_MOE_BASE {
     }
 #endif
 
-    if (!fused_down_reduce) {
-      for (int e = 0; e < config_.hidden_size; e += 32) {
-        __m512 x0 = _mm512_setzero_ps();
-        __m512 x1 = _mm512_setzero_ps();
-        for (int j = 0; j < k; j++) {
-          if (config_.should_skip_expert(expert_ids[j])) {
-            continue;
-          }
-          __m512 weight = _mm512_set1_ps(weights[j]);
-          __m512 down_output0, down_output1;
-          avx512_32xbf16_to_32xfp32(
-              (__m512i*)(m_local_down_output_ptr_[expert_ids[j]] +
-                         m_local_pos_[0][j] * config_.hidden_size + e),
-              &down_output0, &down_output1);
-          x0 = _mm512_fmadd_ps(down_output0, weight, x0);
-          x1 = _mm512_fmadd_ps(down_output1, weight, x1);
+    for (int e = 0; e < config_.hidden_size; e += 32) {
+      __m512 x0 = _mm512_setzero_ps();
+      __m512 x1 = _mm512_setzero_ps();
+      for (int j = 0; j < k; j++) {
+        if (config_.should_skip_expert(expert_ids[j])) {
+          continue;
         }
-        auto f32out = (__m512*)((float*)output + e);
-        f32out[0] = x0;
-        f32out[1] = x1;
+        __m512 weight = _mm512_set1_ps(weights[j]);
+        __m512 down_output0, down_output1;
+        avx512_32xbf16_to_32xfp32(
+            (__m512i*)(m_local_down_output_ptr_[expert_ids[j]] + m_local_pos_[0][j] * config_.hidden_size + e),
+            &down_output0, &down_output1);
+        x0 = _mm512_fmadd_ps(down_output0, weight, x0);
+        x1 = _mm512_fmadd_ps(down_output1, weight, x1);
       }
+      auto f32out = (__m512*)((float*)output + e);
+      f32out[0] = x0;
+      f32out[1] = x1;
     }
 
 #ifdef FORWARD_TIME_PROFILE
@@ -753,22 +711,6 @@ class AMX_MOE_BASE {
   }
 
   bool use_direct_bf16_output() const { return false; }
-
-  bool use_nvfp4_fused_down_reduce() const {
-    if constexpr (T::M_STEP != 1) {
-      return false;
-    }
-    if (config_.quant_config.quant_method != "NVFP4") {
-      return false;
-    }
-    static const bool enabled = [] {
-      const char* value = std::getenv("KT_NVFP4_FUSED_DOWN_REDUCE");
-      if (value == nullptr || *value == '\0') return false;
-      return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
-             std::strcmp(value, "false") != 0;
-    }();
-    return enabled;
-  }
 
  protected:
   Derived* derived() { return static_cast<Derived*>(this); }
