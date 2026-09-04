@@ -10,6 +10,7 @@
 #include <exception>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <type_traits>
@@ -45,6 +46,9 @@ class TP_MOE_Common : public MoE_Interface {
   typename T::output_t* local_output = nullptr;
 
   bool weights_loaded = false;
+  std::mutex nvfp4_route_stats_mutex;
+  std::vector<uint64_t> nvfp4_decode_cpu_topk_hist;
+  uint64_t nvfp4_decode_route_count = 0;
 
 #ifdef FORWARD_TIME_REPORT
   size_t forward_time_sum_ns = 0;
@@ -66,6 +70,7 @@ class TP_MOE_Common : public MoE_Interface {
     }
 
     this->config = config;
+    nvfp4_decode_cpu_topk_hist.resize(config.num_experts_per_tok + 1, 0);
     tp_count = config.pool->config.subpool_count;
     if (config.intermediate_size % tp_count != 0) {
       printf("intermediate_size %d, tp count %d\n", config.intermediate_size, tp_count);
@@ -210,16 +215,41 @@ class TP_MOE_Common : public MoE_Interface {
 #endif
     int qlen = *qlen_ptr;
 
-    if (qlen == 1 && config.quant_config.quant_method == "NVFP4" &&
-        use_nvfp4_zero_cpu_fastpath()) {
-      bool has_cpu_expert = false;
+    const bool nvfp4_decode =
+        qlen == 1 && config.quant_config.quant_method == "NVFP4";
+    const bool zero_cpu_fastpath =
+        nvfp4_decode && use_nvfp4_zero_cpu_fastpath();
+    const size_t route_stats_interval =
+        nvfp4_decode ? nvfp4_route_stats_interval() : 0;
+    if (zero_cpu_fastpath || route_stats_interval != 0) {
+      int cpu_expert_count = 0;
       for (int i = 0; i < k; ++i) {
         if (!config.should_skip_expert(expert_ids[i])) {
-          has_cpu_expert = true;
-          break;
+          ++cpu_expert_count;
         }
       }
-      if (!has_cpu_expert) {
+
+      if (route_stats_interval != 0) {
+        const std::lock_guard<std::mutex> lock(nvfp4_route_stats_mutex);
+        const size_t histogram_index =
+            (size_t)cpu_expert_count < nvfp4_decode_cpu_topk_hist.size()
+                ? (size_t)cpu_expert_count
+                : nvfp4_decode_cpu_topk_hist.size() - 1;
+        ++nvfp4_decode_cpu_topk_hist[histogram_index];
+        ++nvfp4_decode_route_count;
+        if (nvfp4_decode_route_count % route_stats_interval == 0) {
+          std::printf("[NVFP4RouteStats] layer=%d samples=%llu cpu_topk",
+                      config.layer_idx,
+                      (unsigned long long)nvfp4_decode_route_count);
+          for (size_t i = 0; i < nvfp4_decode_cpu_topk_hist.size(); ++i) {
+            std::printf(" %zu=%llu", i,
+                        (unsigned long long)nvfp4_decode_cpu_topk_hist[i]);
+          }
+          std::printf("\n");
+        }
+      }
+
+      if (zero_cpu_fastpath && cpu_expert_count == 0) {
         if (!incremental) {
           std::memset(output, 0,
                       sizeof(input_t) * (size_t)config.hidden_size);
@@ -268,11 +298,22 @@ class TP_MOE_Common : public MoE_Interface {
   static bool use_nvfp4_zero_cpu_fastpath() {
     static const bool enabled = [] {
       const char* value = std::getenv("KT_NVFP4_ZERO_CPU_FASTPATH");
-      if (value == nullptr || *value == '\0') return false;
+      if (value == nullptr || *value == '\0') return true;
       return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
              std::strcmp(value, "false") != 0;
     }();
     return enabled;
+  }
+
+  static size_t nvfp4_route_stats_interval() {
+    static const size_t interval = [] {
+      const char* value = std::getenv("KT_NVFP4_ROUTE_STATS_INTERVAL");
+      if (value == nullptr || *value == '\0') return (size_t)0;
+      char* end = nullptr;
+      const unsigned long long parsed = std::strtoull(value, &end, 10);
+      return end != value && *end == '\0' ? (size_t)parsed : (size_t)0;
+    }();
+    return interval;
   }
 
   virtual void load_weights() = 0;
