@@ -153,6 +153,7 @@ void InNumaPool::do_work_stealing_job_async(int task_num, std::function<void(int
   compute_func_ = compute_func;
   finalize_func_ = finalize_func;
   worker_count = std::min(restricted_worker_count, task_num);
+  static_schedule_ = false;
   curr_.store(0, std::memory_order_release);
   end_ = task_num;
   for (int i = 0; i < worker_count; i++) {
@@ -166,6 +167,29 @@ void InNumaPool::do_work_stealing_job_async(int task_num, std::function<void(int
   process_tasks(0);
 }
 
+void InNumaPool::do_static_job(int task_num,
+                               std::function<void(int)> init_func,
+                               std::function<void(int)> compute_func,
+                               std::function<void(int)> finalize_func) {
+  init_func_ = init_func;
+  compute_func_ = compute_func;
+  finalize_func_ = finalize_func;
+  worker_count = std::min(restricted_worker_count, task_num);
+  static_schedule_ = true;
+  end_ = task_num;
+  for (int i = 0; i < worker_count; i++) {
+    {
+      std::lock_guard<std::mutex> lock(thread_state_[i].mutex);
+      thread_state_[i].status.store(ThreadStatus::WORKING,
+                                    std::memory_order_release);
+    }
+    thread_state_[i].cv.notify_one();
+  }
+  WorkerPool::thread_local_id = 0;
+  process_tasks(0);
+  wait();
+}
+
 void InNumaPool::process_tasks(int thread_id) {
 #ifdef PROFILE_BALANCE
   auto start = std::chrono::high_resolution_clock::now();
@@ -175,26 +199,23 @@ void InNumaPool::process_tasks(int thread_id) {
     init_func_(thread_id);
   }
 
-  // omp-guided-style work scheduling
-  while (true) {
-    int old = curr_.load(std::memory_order_relaxed);
-    int rem = end_ - old;
-    if (rem <= 0) {
-      break;
+  if (static_schedule_ && worker_count > 0) {
+    const int task_begin =
+        static_cast<int>((static_cast<int64_t>(end_) * thread_id) /
+                         worker_count);
+    const int task_end =
+        static_cast<int>((static_cast<int64_t>(end_) * (thread_id + 1)) /
+                         worker_count);
+    for (int task_id = task_begin; task_id < task_end; ++task_id) {
+      compute_func_(task_id);
     }
-
-    int block = (rem + worker_count - 1) / worker_count;
-    block = 1;
-    int task_id = curr_.fetch_add(block, std::memory_order_acq_rel);
-    if (task_id >= end_) {
-      break;
-    }
-
-    for (int i = 0; i < block; i++) {
-      if (task_id + i >= end_) {
+  } else {
+    while (true) {
+      int task_id = curr_.fetch_add(1, std::memory_order_acq_rel);
+      if (task_id >= end_) {
         break;
       }
-      compute_func_(task_id + i);
+      compute_func_(task_id);
     }
   }
 

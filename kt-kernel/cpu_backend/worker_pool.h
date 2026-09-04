@@ -17,6 +17,7 @@
 #include <barrier>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -82,6 +83,7 @@ class InNumaPool {
 
   void do_work_stealing_job(int, std::function<void(int)>, std::function<void(int)>, std::function<void(int)>);
   void do_work_stealing_job(int, std::function<void(int)>);
+  void do_static_job(int, std::function<void(int)>, std::function<void(int)>, std::function<void(int)>);
 
  private:
   int worker_count;
@@ -97,6 +99,7 @@ class InNumaPool {
   std::function<void(int)> finalize_func_;
   std::atomic<int> curr_;
   int end_;
+  bool static_schedule_ = false;
 
   void process_tasks(int);
   void worker_thread(int, int);
