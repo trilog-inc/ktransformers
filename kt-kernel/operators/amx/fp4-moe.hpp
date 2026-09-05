@@ -281,7 +281,7 @@ struct BufferBMXFP4KGroupImpl {
 
   size_t nvfp4_weight_pair_stride_bytes() const {
     return quartet_nvfp4()
-               ? (size_t)NVFP4_N_TILE / 2 * NVFP4_QUARTET_TILES
+               ? (size_t)NVFP4_N_TILE * NVFP4_QUARTET_TILES
                : (size_t)NVFP4_N_TILE;
   }
 
