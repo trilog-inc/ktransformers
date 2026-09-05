@@ -115,6 +115,11 @@ int InNumaPool::get_thread_num() {
 
 void InNumaPool::set_restricted_worker_count(int count) { restricted_worker_count = count; }
 
+bool InNumaPool::has_balanced_static_partition(int task_num) const {
+  const int active_worker_count = std::min(restricted_worker_count, task_num);
+  return active_worker_count > 0 && task_num % active_worker_count == 0;
+}
+
 void InNumaPool::wait() {
   for (int i = 0; i < worker_count; i++) {
     while (thread_state_[i].status.load(std::memory_order_acquire) == ThreadStatus::WORKING) {
