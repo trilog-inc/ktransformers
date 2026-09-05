@@ -1539,7 +1539,8 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
         "Creating AMX_FP4_MOE_TP %d at numa %d (layout=%s, decode_tiles=%d, "
         "prefetch_groups=%d, n_block=%d, scale_storage=%s, "
         "weight_decode=%s, direct_down_input=%d, direct_bf16_output=%d, "
-        "static_schedule=%d, adaptive_schedule=%d)\n",
+        "static_schedule=%d, adaptive_schedule=%d, static_gate_up=%d, "
+        "static_down=%d)\n",
         tp_part_idx, numa_node_of_cpu(sched_getcpu()), layout,
         blocked ? amx::nvfp4_decode_tile_batch() : 1,
         blocked && amx::nvfp4_decode_tile_batch() > 1
@@ -1551,7 +1552,9 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
         this->use_nvfp4_direct_down_input() ? 1 : 0,
         use_direct_bf16_output() ? 1 : 0,
         this->use_nvfp4_static_schedule() ? 1 : 0,
-        this->use_nvfp4_adaptive_schedule() ? 1 : 0);
+        this->use_nvfp4_adaptive_schedule() ? 1 : 0,
+        this->use_nvfp4_static_gate_up_schedule() ? 1 : 0,
+        this->use_nvfp4_static_down_schedule() ? 1 : 0);
   }
 
   ~AMX_FP4_MOE_TP() = default;

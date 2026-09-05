@@ -592,6 +592,7 @@ class AMX_MOE_BASE {
       }
     };
     if (use_nvfp4_static_schedule() ||
+        use_nvfp4_static_gate_up_schedule() ||
         (use_nvfp4_adaptive_schedule() &&
          pool->has_balanced_static_partition(gate_up_task_count))) {
       pool->do_static_job(gate_up_task_count, [](int _) { T::config(); },
@@ -657,7 +658,7 @@ class AMX_MOE_BASE {
             qlen, m_local_down_output_ptr_[expert_idx], ith, nth);
       }
     };
-    if (use_nvfp4_static_schedule() ||
+    if (use_nvfp4_static_schedule() || use_nvfp4_static_down_schedule() ||
         (use_nvfp4_adaptive_schedule() &&
          pool->has_balanced_static_partition(down_task_count))) {
       pool->do_static_job(down_task_count, [](int _) { T::config(); },
@@ -749,6 +750,32 @@ class AMX_MOE_BASE {
     }
     static const bool enabled = [] {
       const char* value = std::getenv("KT_NVFP4_ADAPTIVE_SCHEDULE");
+      if (value == nullptr || *value == '\0') return false;
+      return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+             std::strcmp(value, "false") != 0;
+    }();
+    return enabled;
+  }
+
+  bool use_nvfp4_static_gate_up_schedule() const {
+    if (config_.quant_config.quant_method != "NVFP4") {
+      return false;
+    }
+    static const bool enabled = [] {
+      const char* value = std::getenv("KT_NVFP4_STATIC_GATE_UP");
+      if (value == nullptr || *value == '\0') return false;
+      return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+             std::strcmp(value, "false") != 0;
+    }();
+    return enabled;
+  }
+
+  bool use_nvfp4_static_down_schedule() const {
+    if (config_.quant_config.quant_method != "NVFP4") {
+      return false;
+    }
+    static const bool enabled = [] {
+      const char* value = std::getenv("KT_NVFP4_STATIC_DOWN");
       if (value == nullptr || *value == '\0') return false;
       return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
              std::strcmp(value, "false") != 0;
