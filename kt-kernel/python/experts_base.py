@@ -85,6 +85,7 @@ class KExpertsCPUBuffer:
     temp_buffer: tuple = tuple()
     buffer_depth: int = 2
     int32_route_logged: bool = False
+    int32_route_rejections: set = set()
 
     @classmethod
     def get_buffer(
@@ -411,12 +412,15 @@ class BaseMoEWrapper(_MoEBase, ABC):
         """
         flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
         batch_size = flat_hidden_states.shape[0]
+        int32_routes_requested = os.environ.get("KT_CPU_EXPERT_IDS_INT32") == "1"
+        route_entries = batch_size * self.num_experts_per_tok
+        has_int32_binding = hasattr(self.moe, "forward_i32_task")
         use_int32_expert_ids = (
-            os.environ.get("KT_CPU_EXPERT_IDS_INT32") == "1"
+            int32_routes_requested
             and topk_ids.dtype == torch.int32
             and self.max_deferred_experts_per_token == 0
-            and batch_size * self.num_experts_per_tok <= 64
-            and hasattr(self.moe, "forward_i32_task")
+            and route_entries <= 64
+            and has_int32_binding
         )
         expert_ids_dtype = torch.int32 if use_int32_expert_ids else torch.long
         self._expert_ids_dtype_by_batch[batch_size] = expert_ids_dtype
@@ -424,8 +428,32 @@ class BaseMoEWrapper(_MoEBase, ABC):
             KExpertsCPUBuffer.int32_route_logged = True
             print(
                 "[KTExpertRoutes] Using int32 CPU expert IDs "
-                f"(batch_size={batch_size}, top_k={self.num_experts_per_tok})"
+                f"(batch_size={batch_size}, top_k={self.num_experts_per_tok})",
+                flush=True,
             )
+        elif int32_routes_requested and 0 < route_entries <= 64:
+            rejection_key = (
+                topk_ids.dtype,
+                self.max_deferred_experts_per_token,
+                has_int32_binding,
+            )
+            if rejection_key not in KExpertsCPUBuffer.int32_route_rejections:
+                KExpertsCPUBuffer.int32_route_rejections.add(rejection_key)
+                reasons = []
+                if topk_ids.dtype != torch.int32:
+                    reasons.append(f"topk_ids.dtype={topk_ids.dtype}")
+                if self.max_deferred_experts_per_token != 0:
+                    reasons.append(
+                        "max_deferred_experts_per_token="
+                        f"{self.max_deferred_experts_per_token}"
+                    )
+                if not has_int32_binding:
+                    reasons.append("forward_i32_task is unavailable")
+                print(
+                    "[KTExpertRoutes] int32 CPU expert IDs disabled: "
+                    + ", ".join(reasons),
+                    flush=True,
+                )
 
         (
             input_tensor_cpu,
