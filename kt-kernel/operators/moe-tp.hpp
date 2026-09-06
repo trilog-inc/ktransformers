@@ -3,6 +3,7 @@
 
 // #define CHECK
 
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -202,6 +203,23 @@ class TP_MOE_Common : public MoE_Interface {
   void forward_binding(intptr_t qlen_ptr, int k, intptr_t expert_ids, intptr_t weights, intptr_t input, intptr_t output,
                        bool incremental) {
     forward((int*)qlen_ptr, k, (const int64_t*)expert_ids, (const float*)weights, (const void*)input, (void*)output,
+            incremental);
+  }
+
+  void forward_i32_binding(intptr_t qlen_ptr, int k, intptr_t expert_ids, intptr_t weights, intptr_t input,
+                           intptr_t output, bool incremental) {
+    constexpr size_t MAX_ROUTE_IDS = 64;
+    const int qlen = *(const int*)qlen_ptr;
+    if (qlen < 0 || k < 0 || (size_t)qlen * (size_t)k > MAX_ROUTE_IDS) {
+      throw std::runtime_error("int32 expert route exceeds decode buffer");
+    }
+
+    const int32_t* expert_ids_i32 = (const int32_t*)expert_ids;
+    std::array<int64_t, MAX_ROUTE_IDS> expert_ids_i64;
+    for (size_t i = 0; i < (size_t)qlen * (size_t)k; ++i) {
+      expert_ids_i64[i] = expert_ids_i32[i];
+    }
+    forward((int*)qlen_ptr, k, expert_ids_i64.data(), (const float*)weights, (const void*)input, (void*)output,
             incremental);
   }
 

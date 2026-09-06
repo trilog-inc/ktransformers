@@ -250,6 +250,36 @@ class MOEBindings {
       return cpuinfer_interface(moe, qlen, k, expert_ids, weights, input, output, false);
     }
   };
+  class ForwardInt32Bindings {
+   public:
+    struct Args {
+      CPUInfer* cpuinfer;
+      TP_MOE<T>* moe;
+      intptr_t qlen;
+      int k;
+      intptr_t expert_ids;
+      intptr_t weights;
+      intptr_t input;
+      intptr_t output;
+      bool incremental;
+    };
+    static void inner(void* args) {
+      Args* args_ = (Args*)args;
+      args_->cpuinfer->enqueue(&TP_MOE<T>::forward_i32_binding, args_->moe, args_->qlen, args_->k,
+                               args_->expert_ids, args_->weights, args_->input, args_->output, args_->incremental);
+    }
+    static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe, intptr_t qlen, int k,
+                                                            intptr_t expert_ids, intptr_t weights, intptr_t input,
+                                                            intptr_t output, bool incremental = false) {
+      Args* args = new Args{nullptr, moe.get(), qlen, k, expert_ids, weights, input, output, incremental};
+      return std::make_pair((intptr_t)&inner, (intptr_t)args);
+    }
+    static std::pair<intptr_t, intptr_t> cpuinfer_interface(std::shared_ptr<TP_MOE<T>> moe, intptr_t qlen, int k,
+                                                            intptr_t expert_ids, intptr_t weights, intptr_t input,
+                                                            intptr_t output) {
+      return cpuinfer_interface(moe, qlen, k, expert_ids, weights, input, output, false);
+    }
+  };
 };
 
 #if defined(__x86_64__) && defined(USE_AMX_AVX_KERNEL)
@@ -467,6 +497,12 @@ void bind_moe_module(py::module_& moe_module, const char* name) {
       .def("forward_task",
            py::overload_cast<std::shared_ptr<MoeClass>, intptr_t, int, intptr_t, intptr_t, intptr_t, intptr_t, bool>(
                &MoeBindings::ForwardBindings::cpuinfer_interface))
+      .def("forward_i32_task",
+           py::overload_cast<std::shared_ptr<MoeClass>, intptr_t, int, intptr_t, intptr_t, intptr_t, intptr_t>(
+               &MoeBindings::ForwardInt32Bindings::cpuinfer_interface))
+      .def("forward_i32_task",
+           py::overload_cast<std::shared_ptr<MoeClass>, intptr_t, int, intptr_t, intptr_t, intptr_t, intptr_t, bool>(
+               &MoeBindings::ForwardInt32Bindings::cpuinfer_interface))
       .def("warm_up", &MoeClass::warm_up)
       .def("load_weights", &MoeClass::load_weights)
       .def("forward", &MoeClass::forward_binding);
