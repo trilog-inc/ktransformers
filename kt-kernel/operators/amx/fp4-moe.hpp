@@ -92,6 +92,20 @@ inline bool use_nvfp4_bf16_scales() {
 #endif
 }
 
+inline bool use_nvfp4_batch_scale_decode() {
+#if defined(__AVX512BF16__)
+  static const bool enabled = [] {
+    const char* value = std::getenv("KT_NVFP4_BATCH_SCALE_DECODE");
+    if (value == nullptr || *value == '\0') return false;
+    return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+           std::strcmp(value, "false") != 0;
+  }();
+  return enabled;
+#else
+  return false;
+#endif
+}
+
 inline bool use_nvfp4_vbmi_decode() {
 #if defined(__AVX512BF16__) && defined(__AVX512VBMI__) && \
     defined(__AVX512VL__)
@@ -571,6 +585,12 @@ struct GemmKernel224MXFP4SmallKGroup {
       0x0000, 0x3F00, 0x3F80, 0x3FC0, 0x4000, 0x4040, 0x4080, 0x40C0,
       0x8000, 0xBF00, 0xBF80, 0xBFC0, 0xC000, 0xC040, 0xC080, 0xC0C0};
 
+  alignas(64) static constexpr uint16_t e4m3fn_subnormal_bf16[32] = {
+      0x0000, 0x3B00, 0x3B80, 0x3BC0, 0x3C00, 0x3C20, 0x3C40, 0x3C60,
+      0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+      0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+      0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000};
+
   // Convert 16 packed FP4 bytes (32 values = 1 k_group) → 32 BF16 values (__m512i)
   // Output column order: [BF16(lo[0]),BF16(hi[0]), ..., BF16(lo[15]),BF16(hi[15])]
   __attribute__((always_inline)) static inline __m512i mxfp4_to_bf16_32(__m128i packed) {
@@ -738,6 +758,57 @@ struct GemmKernel224MXFP4SmallKGroup {
     const __m512i bits =
         _mm512_slli_epi32(_mm512_cvtepu16_epi32(values), 16);
     return _mm512_castsi512_ps(bits);
+  }
+
+  __attribute__((always_inline)) static inline void bf16x32_to_fp32(
+      __m512i packed, __m512* first, __m512* second) {
+    const __m256i packed_first = _mm512_castsi512_si256(packed);
+    const __m256i packed_second = _mm512_extracti64x4_epi64(packed, 1);
+    *first = _mm512_castsi512_ps(
+        _mm512_slli_epi32(_mm512_cvtepu16_epi32(packed_first), 16));
+    *second = _mm512_castsi512_ps(
+        _mm512_slli_epi32(_mm512_cvtepu16_epi32(packed_second), 16));
+  }
+
+  // Convert 32 E4M3FN values to BF16 in parallel. Normal E4M3 values map to
+  // BF16 with a shift and exponent-bias adjustment; the eight subnormal
+  // magnitudes use a small VPERMW lookup. This preserves every finite E4M3FN
+  // value exactly, including signed zero and subnormals.
+  __attribute__((always_inline)) static inline __m512i
+  e4m3fnx32_to_bf16(__m256i packed) {
+    const __m512i raw = _mm512_cvtepu8_epi16(packed);
+    const __m512i magnitude =
+        _mm512_and_si512(raw, _mm512_set1_epi16(0x007F));
+    const __m512i sign = _mm512_slli_epi16(
+        _mm512_and_si512(raw, _mm512_set1_epi16(0x0080)), 8);
+    const __m512i normal = _mm512_add_epi16(
+        _mm512_slli_epi16(magnitude, 4), _mm512_set1_epi16(0x3C00));
+    const __m512i subnormal_lut =
+        _mm512_load_si512(e4m3fn_subnormal_bf16);
+    const __m512i subnormal =
+        _mm512_permutexvar_epi16(magnitude, subnormal_lut);
+    const __mmask32 is_subnormal = _mm512_cmpeq_epi16_mask(
+        _mm512_and_si512(magnitude, _mm512_set1_epi16(0x0078)),
+        _mm512_setzero_si512());
+    return _mm512_or_si512(
+        _mm512_mask_blend_epi16(is_subnormal, normal, subnormal), sign);
+  }
+
+  // Quartet storage places the four tiles' 64 one-byte scales next to each
+  // other. Decode two 32-scale vectors instead of independently widening four
+  // 16-scale vectors, then split them into the four FP32 scale registers used
+  // by the mat-vec loop.
+  __attribute__((always_inline)) static inline void e4m3fnx64_to_fp32(
+      const uint8_t* packed, __m512* scale0, __m512* scale1,
+      __m512* scale2, __m512* scale3) {
+    const __m512i values =
+        _mm512_loadu_si512(reinterpret_cast<const __m512i*>(packed));
+    const __m512i bf16_first =
+        e4m3fnx32_to_bf16(_mm512_castsi512_si256(values));
+    const __m512i bf16_second = e4m3fnx32_to_bf16(
+        _mm512_extracti64x4_epi64(values, 1));
+    bf16x32_to_fp32(bf16_first, scale0, scale1);
+    bf16x32_to_fp32(bf16_second, scale2, scale3);
   }
 
   template <bool BF16_SCALE>
@@ -992,6 +1063,8 @@ struct GemmKernel224MXFP4SmallKGroup {
     const size_t weight_pair_stride =
         bb->nvfp4_weight_pair_stride_bytes();
     const bool quartet_layout = bb->quartet_nvfp4();
+    const bool batch_scale_decode =
+        !BF16_SCALE && quartet_layout && use_nvfp4_batch_scale_decode();
     const size_t quartet_scale_bytes =
         BufferB::NVFP4_QUARTET_TILES * bb->nvfp4_scale_tile_bytes();
     const int group_count = k / BufferB::NVFP4_K_GROUP;
@@ -1128,14 +1201,23 @@ struct GemmKernel224MXFP4SmallKGroup {
                                     group_sum3);
 #undef NVFP4_DP_PAIR_FOUR_TILES
 
-          const __m512 scales0 =
-              load_nvfp4_scales<BF16_SCALE>(scale_base0 + scale_offset);
-          const __m512 scales1 =
-              load_nvfp4_scales<BF16_SCALE>(scale_base1 + scale_offset);
-          const __m512 scales2 =
-              load_nvfp4_scales<BF16_SCALE>(scale_base2 + scale_offset);
-          const __m512 scales3 =
-              load_nvfp4_scales<BF16_SCALE>(scale_base3 + scale_offset);
+          __m512 scales0, scales1, scales2, scales3;
+          if constexpr (!BF16_SCALE) {
+            if (batch_scale_decode) {
+              e4m3fnx64_to_fp32(scale_base0 + scale_offset, &scales0,
+                                &scales1, &scales2, &scales3);
+            } else {
+              scales0 = load_nvfp4_scales<false>(scale_base0 + scale_offset);
+              scales1 = load_nvfp4_scales<false>(scale_base1 + scale_offset);
+              scales2 = load_nvfp4_scales<false>(scale_base2 + scale_offset);
+              scales3 = load_nvfp4_scales<false>(scale_base3 + scale_offset);
+            }
+          } else {
+            scales0 = load_nvfp4_scales<true>(scale_base0 + scale_offset);
+            scales1 = load_nvfp4_scales<true>(scale_base1 + scale_offset);
+            scales2 = load_nvfp4_scales<true>(scale_base2 + scale_offset);
+            scales3 = load_nvfp4_scales<true>(scale_base3 + scale_offset);
+          }
           total0 = _mm512_fmadd_ps(group_sum0, scales0, total0);
           total1 = _mm512_fmadd_ps(group_sum1, scales1, total1);
           total2 = _mm512_fmadd_ps(group_sum2, scales2, total2);
@@ -1538,7 +1620,8 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     printf(
         "Creating AMX_FP4_MOE_TP %d at numa %d (layout=%s, decode_tiles=%d, "
         "prefetch_groups=%d, n_block=%d, scale_storage=%s, "
-        "weight_decode=%s, direct_down_input=%d, direct_bf16_output=%d, "
+        "weight_decode=%s, batch_scale_decode=%d, direct_down_input=%d, "
+        "direct_bf16_output=%d, "
         "static_schedule=%d, adaptive_schedule=%d, static_gate_up=%d, "
         "static_down=%d)\n",
         tp_part_idx, numa_node_of_cpu(sched_getcpu()), layout,
@@ -1549,6 +1632,11 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
         blocked ? amx::nvfp4_n_block()
                 : amx::GemmKernel224MXFP4SmallKGroup::N_BLOCK,
         scale_storage, weight_decode,
+        blocked && !amx::use_nvfp4_bf16_scales() &&
+                amx::use_nvfp4_quartet_layout() &&
+                amx::use_nvfp4_batch_scale_decode()
+            ? 1
+            : 0,
         this->use_nvfp4_direct_down_input() ? 1 : 0,
         use_direct_bf16_output() ? 1 : 0,
         this->use_nvfp4_static_schedule() ? 1 : 0,
