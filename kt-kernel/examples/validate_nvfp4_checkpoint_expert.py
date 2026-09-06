@@ -63,6 +63,21 @@ def parse_args() -> argparse.Namespace:
         help="Repeat the timed region and report median performance.",
     )
     parser.add_argument(
+        "--benchmark-duration-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "Run an additional sustained benchmark for this many seconds. "
+            "Useful for detecting thermal, power, and frequency throttling."
+        ),
+    )
+    parser.add_argument(
+        "--benchmark-report-interval-seconds",
+        type=float,
+        default=30.0,
+        help="Reporting interval for --benchmark-duration-seconds.",
+    )
+    parser.add_argument(
         "--benchmark-expert-count",
         type=int,
         default=1,
@@ -279,11 +294,17 @@ def benchmark_native_forward(
     top_k: int,
     cpu_top_k: int,
     repeats: int,
+    duration_seconds: float,
+    report_interval_seconds: float,
 ) -> None:
-    if iterations <= 0:
+    if iterations <= 0 and duration_seconds <= 0:
         return
     if repeats < 1:
         raise ValueError("--benchmark-repeats must be at least 1")
+    if duration_seconds > 0 and report_interval_seconds <= 0:
+        raise ValueError(
+            "--benchmark-report-interval-seconds must be greater than zero"
+        )
 
     output = torch.empty_like(inputs)
     batch_size = torch.ones(1, dtype=torch.int32)
@@ -328,15 +349,6 @@ def benchmark_native_forward(
     for iteration in range(warmup_runs):
         run_once(iteration)
 
-    samples = []
-    for repeat in range(repeats):
-        started = time.perf_counter()
-        for iteration in range(iterations):
-            run_once(repeat * iterations + iteration)
-        elapsed = time.perf_counter() - started
-        samples.append(elapsed / iterations)
-
-    seconds_per_forward = statistics.median(samples)
     projection_elements = 3 * hidden_size * intermediate_size
     checkpoint_bytes = projection_elements * (0.5 + 1.0 / 16.0)
     bf16_scales = os.getenv("KT_NVFP4_BF16_SCALES", "").lower() not in (
@@ -348,25 +360,84 @@ def benchmark_native_forward(
     resident_bytes = projection_elements * (
         0.5 + (2.0 if bf16_scales else 1.0) / 16.0
     )
-    effective_gbps = (
-        checkpoint_bytes * cpu_top_k / seconds_per_forward / 1e9
-    )
-    resident_gbps = resident_bytes * cpu_top_k / seconds_per_forward / 1e9
     benchmark_kind = "LLC-hot" if expert_count == 1 else "rotating"
     working_set_gb = resident_bytes * expert_count / 1e9
-    print(
-        f"  benchmark ({benchmark_kind}, experts={expert_count}, "
-        f"route_top_k={top_k}, cpu_top_k={cpu_top_k}, "
-        f"weight_working_set={working_set_gb:.3f} GB): "
-        f"{seconds_per_forward * 1e3:.3f} ms/forward "
-        f"{1.0 / seconds_per_forward:.3f} forwards/s "
-        f"{effective_gbps:.3f} checkpoint_weight_GB/s "
-        f"{resident_gbps:.3f} resident_weight_GB/s"
-    )
-    if repeats > 1:
-        sample_ms = ", ".join(f"{sample * 1e3:.3f}" for sample in samples)
-        spread = (max(samples) - min(samples)) / seconds_per_forward * 100.0
-        print(f"    samples_ms=[{sample_ms}] spread={spread:.2f}%")
+
+    def report(label: str, seconds_per_forward: float) -> None:
+        effective_gbps = (
+            checkpoint_bytes * cpu_top_k / seconds_per_forward / 1e9
+        )
+        resident_gbps = resident_bytes * cpu_top_k / seconds_per_forward / 1e9
+        print(
+            f"  {label}: {seconds_per_forward * 1e3:.3f} ms/forward "
+            f"{1.0 / seconds_per_forward:.3f} forwards/s "
+            f"{effective_gbps:.3f} checkpoint_weight_GB/s "
+            f"{resident_gbps:.3f} resident_weight_GB/s",
+            flush=True,
+        )
+
+    if iterations > 0:
+        samples = []
+        for repeat in range(repeats):
+            started = time.perf_counter()
+            for iteration in range(iterations):
+                run_once(repeat * iterations + iteration)
+            elapsed = time.perf_counter() - started
+            samples.append(elapsed / iterations)
+
+        seconds_per_forward = statistics.median(samples)
+        report(
+            f"benchmark ({benchmark_kind}, experts={expert_count}, "
+            f"route_top_k={top_k}, cpu_top_k={cpu_top_k}, "
+            f"weight_working_set={working_set_gb:.3f} GB)",
+            seconds_per_forward,
+        )
+        if repeats > 1:
+            sample_ms = ", ".join(f"{sample * 1e3:.3f}" for sample in samples)
+            spread = (max(samples) - min(samples)) / seconds_per_forward * 100.0
+            print(f"    samples_ms=[{sample_ms}] spread={spread:.2f}%")
+
+    if duration_seconds > 0:
+        sustained_start = time.perf_counter()
+        sustained_deadline = sustained_start + duration_seconds
+        window_start = sustained_start
+        next_report = min(
+            sustained_start + report_interval_seconds,
+            sustained_deadline,
+        )
+        total_forwards = 0
+        window_forwards = 0
+        while True:
+            for _ in range(256):
+                run_once(total_forwards)
+                total_forwards += 1
+                window_forwards += 1
+            now = time.perf_counter()
+            if now < next_report:
+                continue
+
+            window_elapsed = now - window_start
+            elapsed = now - sustained_start
+            report(
+                f"sustained t={elapsed:.1f}s window={window_elapsed:.1f}s",
+                window_elapsed / window_forwards,
+            )
+            window_start = now
+            window_forwards = 0
+            if now >= sustained_deadline:
+                break
+            next_report = min(
+                next_report + report_interval_seconds,
+                sustained_deadline,
+            )
+
+        total_elapsed = time.perf_counter() - sustained_start
+        report(
+            f"sustained total ({benchmark_kind}, experts={expert_count}, "
+            f"route_top_k={top_k}, cpu_top_k={cpu_top_k}, "
+            f"weight_working_set={working_set_gb:.3f} GB)",
+            total_elapsed / total_forwards,
+        )
 
 
 def selected_backends(name: str):
@@ -447,6 +518,8 @@ def main() -> None:
             args.benchmark_top_k,
             args.benchmark_cpu_top_k,
             args.benchmark_repeats,
+            args.benchmark_duration_seconds,
+            args.benchmark_report_interval_seconds,
         )
         del moe, physical_to_logical, cpu_infer, actual
         gc.collect()
