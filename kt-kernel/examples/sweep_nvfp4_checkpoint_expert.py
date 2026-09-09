@@ -49,6 +49,12 @@ DEFAULT_CPU_TOP_K_WEIGHTS = (
     4556,
 )
 
+# Smaller runtime N blocks benchmark well in the isolated expert harness but
+# have produced corrupt full-model GLM-5.3 output. Keep the stage available for
+# explicit investigation without allowing it into production-oriented sweeps.
+EXPERIMENTAL_STAGES = frozenset({"n-block"})
+SWEEP_SCHEMA_VERSION = 3
+
 # Start from the strongest settings found in the GLM-5.3 tuning runs. Every
 # value is still retested, so this only reduces the path to a good combination.
 TUNED_START = {
@@ -57,7 +63,7 @@ TUNED_START = {
     "KT_NVFP4_QUARTET_LAYOUT": "1",
     "KT_NVFP4_DECODE_TILE_BATCH": "4",
     "KT_NVFP4_PREFETCH_GROUPS": "5",
-    "KT_NVFP4_N_BLOCK": "128",
+    "KT_NVFP4_N_BLOCK": "256",
     "KT_NVFP4_BF16_SCALES": "1",
     "KT_NVFP4_BATCH_SCALE_DECODE": "0",
     "KT_NVFP4_VBMI_DECODE": "1",
@@ -364,7 +370,11 @@ def parse_args() -> argparse.Namespace:
         "--stages",
         nargs="+",
         choices=tuple(stage for stage, _ in STAGES),
-        help="Run only selected stages, in their normal order.",
+        help=(
+            "Run only selected stages, in their normal order. The n-block "
+            "stage is excluded by default because values below 256 are not "
+            "yet production-correct."
+        ),
     )
     parser.add_argument("--shuffle-seed", type=int, default=20260908)
     parser.add_argument(
@@ -756,18 +766,26 @@ def main() -> None:
         if not metadata_path.exists():
             raise SystemExit(f"Cannot resume without metadata: {metadata_path}")
         prior_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-        if prior_metadata.get("schema_version") != 2:
+        if prior_metadata.get("schema_version") != SWEEP_SCHEMA_VERSION:
             raise SystemExit(
-                "This result directory uses the earlier single-route score. "
-                "Start a new sweep directory for weighted hybrid scoring."
+                "This result directory uses an earlier sweep schema. Start a "
+                "new directory so production-unsafe candidates are not reused."
             )
 
-    selected_names = set(args.stages) if args.stages else None
+    selected_names = set(args.stages) if args.stages else {
+        name for name, _ in STAGES if name not in EXPERIMENTAL_STAGES
+    }
     selected_stages = [
         (name, options)
         for name, options in STAGES
-        if selected_names is None or name in selected_names
+        if name in selected_names
     ]
+    explicitly_selected_experimental = selected_names & EXPERIMENTAL_STAGES
+    if explicitly_selected_experimental:
+        print(
+            "WARNING: explicitly running production-unsafe experimental "
+            f"stage(s): {', '.join(sorted(explicitly_selected_experimental))}"
+        )
     command = benchmark_command(args)
     completed = load_results(results_path) if args.resume else {}
     current = TUNED_START.copy()
@@ -781,7 +799,7 @@ def main() -> None:
     maximum_runs = primary_runs + confirmation_runs
 
     metadata = {
-        "schema_version": 2,
+        "schema_version": SWEEP_SCHEMA_VERSION,
         "model_path": str(args.model_path.resolve()),
         "command": command,
         "cooldown_seconds": args.cooldown_seconds,
