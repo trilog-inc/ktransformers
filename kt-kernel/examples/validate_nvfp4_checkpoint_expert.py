@@ -106,6 +106,15 @@ def parse_args() -> argparse.Namespace:
             "--benchmark-top-k."
         ),
     )
+    parser.add_argument(
+        "--benchmark-cpu-top-k-values",
+        type=int,
+        nargs="+",
+        help=(
+            "Benchmark several CPU expert counts with one loaded operator. "
+            "This is useful for weighting a heterogeneous route distribution."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -128,17 +137,29 @@ def load_checkpoint_experts(args: argparse.Namespace):
         raise ValueError("--benchmark-expert-count must be at least 1")
     if args.benchmark_top_k < 1:
         raise ValueError("--benchmark-top-k must be at least 1")
-    if args.benchmark_cpu_top_k is None:
-        args.benchmark_cpu_top_k = args.benchmark_top_k
-    if not 0 <= args.benchmark_cpu_top_k <= args.benchmark_top_k:
-        raise ValueError(
-            "--benchmark-cpu-top-k must be between 0 and --benchmark-top-k"
+    if args.benchmark_cpu_top_k_values:
+        benchmark_cpu_top_ks = list(
+            dict.fromkeys(args.benchmark_cpu_top_k_values)
         )
-    if args.benchmark_cpu_top_k > args.benchmark_expert_count:
-        raise ValueError(
-            "--benchmark-cpu-top-k must not exceed "
-            "--benchmark-expert-count"
-        )
+    else:
+        benchmark_cpu_top_ks = [
+            args.benchmark_cpu_top_k
+            if args.benchmark_cpu_top_k is not None
+            else args.benchmark_top_k
+        ]
+    for cpu_top_k in benchmark_cpu_top_ks:
+        if not 0 <= cpu_top_k <= args.benchmark_top_k:
+            raise ValueError(
+                "CPU top-k benchmark values must be between 0 and "
+                "--benchmark-top-k"
+            )
+        if cpu_top_k > args.benchmark_expert_count:
+            raise ValueError(
+                "CPU top-k benchmark values must not exceed "
+                "--benchmark-expert-count"
+            )
+    args.benchmark_cpu_top_k_values = benchmark_cpu_top_ks
+    args.benchmark_cpu_top_k = benchmark_cpu_top_ks[-1]
     expert_ids = list(
         range(args.expert, args.expert + args.benchmark_expert_count)
     )
@@ -506,21 +527,22 @@ def main() -> None:
         )
         print("  expected[:8]", expected[0, :8].float().tolist())
         print("  actual[:8]  ", actual[0, :8].float().tolist())
-        benchmark_native_forward(
-            moe,
-            cpu_infer,
-            inputs,
-            args.benchmark_iterations,
-            args.benchmark_warmup,
-            args.hidden_size,
-            args.intermediate_size,
-            len(weight_bank),
-            args.benchmark_top_k,
-            args.benchmark_cpu_top_k,
-            args.benchmark_repeats,
-            args.benchmark_duration_seconds,
-            args.benchmark_report_interval_seconds,
-        )
+        for cpu_top_k in args.benchmark_cpu_top_k_values:
+            benchmark_native_forward(
+                moe,
+                cpu_infer,
+                inputs,
+                args.benchmark_iterations,
+                args.benchmark_warmup,
+                args.hidden_size,
+                args.intermediate_size,
+                len(weight_bank),
+                args.benchmark_top_k,
+                cpu_top_k,
+                args.benchmark_repeats,
+                args.benchmark_duration_seconds,
+                args.benchmark_report_interval_seconds,
+            )
         del moe, physical_to_logical, cpu_infer, actual
         gc.collect()
         if not passed:
