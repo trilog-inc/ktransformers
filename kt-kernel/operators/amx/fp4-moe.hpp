@@ -2088,30 +2088,31 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
         pool->get_subpool(i)->do_work_stealing_job(
             tpc.expert_num, nullptr,
             [&, i](int expert_id_) {
-              size_t expert_id = expert_map(physical_to_logical_map, expert_id_);
+              size_t logical_expert_id = expert_map(physical_to_logical_map, expert_id_);
 
-              uint8_t* src_gate = (uint8_t*)config.gate_projs[0][expert_id];
-              uint8_t* src_up = (uint8_t*)config.up_projs[0][expert_id];
-              uint8_t* src_down = (uint8_t*)config.down_projs[0][expert_id];
-              ggml_bf16_t* src_gate_scale = (ggml_bf16_t*)config.gate_scales[0][expert_id];
-              ggml_bf16_t* src_up_scale = (ggml_bf16_t*)config.up_scales[0][expert_id];
-              ggml_bf16_t* src_down_scale = (ggml_bf16_t*)config.down_scales[0][expert_id];
+              uint8_t* src_gate = (uint8_t*)config.gate_projs[0][logical_expert_id];
+              uint8_t* src_up = (uint8_t*)config.up_projs[0][logical_expert_id];
+              uint8_t* src_down = (uint8_t*)config.down_projs[0][logical_expert_id];
+              ggml_bf16_t* src_gate_scale = (ggml_bf16_t*)config.gate_scales[0][logical_expert_id];
+              ggml_bf16_t* src_up_scale = (ggml_bf16_t*)config.up_scales[0][logical_expert_id];
+              ggml_bf16_t* src_down_scale = (ggml_bf16_t*)config.down_scales[0][logical_expert_id];
 
-              memcpy((uint8_t*)tpc.gate_proj + ((expert_id * weight_elem_count) >> 1),
+              memcpy((uint8_t*)tpc.gate_proj + ((expert_id_ * weight_elem_count) >> 1),
                      src_gate + ((i * weight_elem_count) >> 1), (weight_elem_count >> 1));
-              memcpy((uint8_t*)tpc.up_proj + ((expert_id * weight_elem_count) >> 1),
+              memcpy((uint8_t*)tpc.up_proj + ((expert_id_ * weight_elem_count) >> 1),
                      src_up + ((i * weight_elem_count) >> 1), (weight_elem_count >> 1));
-              memcpy((ggml_bf16_t*)tpc.gate_scale + (expert_id * scales_elem_count),
+              memcpy((ggml_bf16_t*)tpc.gate_scale + (expert_id_ * scales_elem_count),
                      src_gate_scale + (i * scales_elem_count), sizeof(ggml_bf16_t) * scales_elem_count);
-              memcpy((ggml_bf16_t*)tpc.up_scale + (expert_id * scales_elem_count),
+              memcpy((ggml_bf16_t*)tpc.up_scale + (expert_id_ * scales_elem_count),
                      src_up_scale + (i * scales_elem_count), sizeof(ggml_bf16_t) * scales_elem_count);
 
               for (size_t col = 0; col < config.hidden_size; col++) {
-                memcpy((uint8_t*)tpc.down_proj + ((expert_id * weight_elem_count + col * tpc.intermediate_size) >> 1),
+                memcpy((uint8_t*)tpc.down_proj +
+                           ((expert_id_ * weight_elem_count + col * tpc.intermediate_size) >> 1),
                        src_down + ((col * config.intermediate_size + i * tpc.intermediate_size) >> 1),
                        (tpc.intermediate_size >> 1));
                 memcpy((ggml_bf16_t*)tpc.down_scale +
-                           (expert_id * scales_elem_count + col * (tpc.intermediate_size / group_size)),
+                           (expert_id_ * scales_elem_count + col * (tpc.intermediate_size / group_size)),
                        src_down_scale +
                            (col * (config.intermediate_size / group_size) + i * (tpc.intermediate_size / group_size)),
                        sizeof(ggml_bf16_t) * (tpc.intermediate_size / group_size));
@@ -2123,37 +2124,43 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
           pool->get_subpool(i)->do_work_stealing_job(
               tpc.expert_num, nullptr,
               [&, i](int expert_id_) {
-                size_t expert_id = expert_map(physical_to_logical_map, expert_id_);
+                size_t logical_expert_id = expert_map(physical_to_logical_map, expert_id_);
 
-                memcpy((uint8_t*)tpc.gate_proj + ((expert_id * weight_elem_count) >> 1),
+                memcpy((uint8_t*)tpc.gate_proj + ((expert_id_ * weight_elem_count) >> 1),
                        (uint8_t*)config.gate_proj +
-                           ((expert_id * config.intermediate_size * config.hidden_size + i * weight_elem_count) >> 1),
+                           ((logical_expert_id * config.intermediate_size * config.hidden_size +
+                             i * weight_elem_count) >>
+                            1),
                        (weight_elem_count >> 1));
-                memcpy((uint8_t*)tpc.up_proj + ((expert_id * weight_elem_count) >> 1),
+                memcpy((uint8_t*)tpc.up_proj + ((expert_id_ * weight_elem_count) >> 1),
                        (uint8_t*)config.up_proj +
-                           ((expert_id * config.intermediate_size * config.hidden_size + i * weight_elem_count) >> 1),
+                           ((logical_expert_id * config.intermediate_size * config.hidden_size +
+                             i * weight_elem_count) >>
+                            1),
                        (weight_elem_count >> 1));
-                memcpy((ggml_bf16_t*)tpc.gate_scale + (expert_id * scales_elem_count),
+                memcpy((ggml_bf16_t*)tpc.gate_scale + (expert_id_ * scales_elem_count),
                        (ggml_bf16_t*)config.gate_scale +
-                           (expert_id * (config.hidden_size / group_size) * config.intermediate_size +
+                           (logical_expert_id * (config.hidden_size / group_size) * config.intermediate_size +
                             i * scales_elem_count),
                        sizeof(ggml_bf16_t) * scales_elem_count);
-                memcpy((ggml_bf16_t*)tpc.up_scale + (expert_id * scales_elem_count),
+                memcpy((ggml_bf16_t*)tpc.up_scale + (expert_id_ * scales_elem_count),
                        (ggml_bf16_t*)config.up_scale +
-                           (expert_id * (config.hidden_size / group_size) * config.intermediate_size +
+                           (logical_expert_id * (config.hidden_size / group_size) * config.intermediate_size +
                             i * scales_elem_count),
                        sizeof(ggml_bf16_t) * scales_elem_count);
 
                 for (size_t col = 0; col < config.hidden_size; col++) {
-                  memcpy((uint8_t*)tpc.down_proj + ((expert_id * weight_elem_count + col * tpc.intermediate_size) >> 1),
-                         (uint8_t*)config.down_proj + ((expert_id * config.intermediate_size * config.hidden_size +
-                                                        col * config.intermediate_size + i * tpc.intermediate_size) >>
-                                                       1),
+                  memcpy((uint8_t*)tpc.down_proj +
+                             ((expert_id_ * weight_elem_count + col * tpc.intermediate_size) >> 1),
+                         (uint8_t*)config.down_proj +
+                             ((logical_expert_id * config.intermediate_size * config.hidden_size +
+                               col * config.intermediate_size + i * tpc.intermediate_size) >>
+                              1),
                          (tpc.intermediate_size >> 1));
                   memcpy((ggml_bf16_t*)tpc.down_scale +
-                             (expert_id * scales_elem_count + col * (tpc.intermediate_size / group_size)),
+                             (expert_id_ * scales_elem_count + col * (tpc.intermediate_size / group_size)),
                          (ggml_bf16_t*)config.down_scale +
-                             ((expert_id * (config.intermediate_size / group_size) * config.hidden_size) +
+                             ((logical_expert_id * (config.intermediate_size / group_size) * config.hidden_size) +
                               col * (config.intermediate_size / group_size) + i * (tpc.intermediate_size / group_size)),
                          sizeof(ggml_bf16_t) * (tpc.intermediate_size / group_size));
                 }
@@ -2164,7 +2171,13 @@ class TP_MOE<AMX_FP4_MOE_TP<K>> : public TP_MOE<AMX_MOE_BASE<K, AMX_FP4_MOE_TP<K
       printf("TP %d load weight done.\n", i);
     });
 
-    DO_TPS_LOAD_WEIGHTS(pool);
+    // Each NUMA-local buffer above is already compacted into physical expert
+    // slots.  Reapplying the logical source map here would index those compact
+    // buffers with checkpoint ids and read out of bounds.
+    pool->dispense_backend()->do_numa_job([this](int numa_id) {
+      this->tps[numa_id]->config_.physical_to_logical_map = nullptr;
+      this->tps[numa_id]->load_weights();
+    });
 
     pool->dispense_backend()->do_numa_job([&, this](int i) {
       auto& tpc = tps[i]->config_;
