@@ -1840,30 +1840,48 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     if (bytes -= chunks * 64) std::memcpy(d, s, bytes);
   }
 
-  static inline void fast_fp32_to_bf16(ggml_bf16_t* __restrict dst, const float* __restrict src, size_t count) {
-    size_t i = 0;
-    for (; i + 32 <= count; i += 32) {
-      __m512 v0 = _mm512_loadu_ps(src + i);
-      __m512 v1 = _mm512_loadu_ps(src + i + 16);
-      __m512i i0 = _mm512_srli_epi32(_mm512_castps_si512(v0), 16);
-      __m512i i1 = _mm512_srli_epi32(_mm512_castps_si512(v1), 16);
-      __m512i packed = _mm512_packus_epi32(i0, i1);
-      __m512i permuted = _mm512_permutexvar_epi64(_mm512_set_epi64(7, 5, 3, 1, 6, 4, 2, 0), packed);
-      _mm512_storeu_si512((__m512i*)(dst + i), permuted);
-    }
-    for (; i < count; i++) dst[i] = ggml_fp32_to_bf16(src[i]);
-  }
-
-  static inline void fast_scale_to_bf16(
-      ggml_bf16_t* __restrict dst,
+  // The SGLang/Marlin staging ABI stores one raw UE8M0 exponent byte per
+  // group.  AMX keeps group-32 scales internally as either BF16 or FP32, both
+  // of which represent the checkpoint's powers of two exactly.  Extracting
+  // their exponent fields therefore restores the original UE8M0 payload
+  // losslessly and, critically, writes one byte rather than overflowing the
+  // caller's scale buffer with two-byte BF16 values.
+  static inline void fast_scale_to_ue8m0(
+      uint8_t* __restrict dst,
       const typename T::BufferB& src,
       size_t offset,
       size_t count) {
     const void* scale_data = src.scale_data(offset);
     if (src.bf16_mxfp4_scales()) {
-      fast_memcpy(dst, scale_data, count * sizeof(ggml_bf16_t));
+      const auto* values = static_cast<const ggml_bf16_t*>(scale_data);
+      size_t i = 0;
+      for (; i + 32 <= count; i += 32) {
+        const __m512i bits =
+            _mm512_loadu_si512(reinterpret_cast<const __m512i*>(values + i));
+        const __m512i exponents = _mm512_srli_epi16(bits, 7);
+        const __m256i packed = _mm512_cvtepi16_epi8(exponents);
+        _mm256_storeu_si256(reinterpret_cast<__m256i*>(dst + i), packed);
+      }
+      for (; i < count; ++i) {
+        uint16_t bits;
+        std::memcpy(&bits, values + i, sizeof(bits));
+        dst[i] = static_cast<uint8_t>(bits >> 7);
+      }
     } else {
-      fast_fp32_to_bf16(dst, static_cast<const float*>(scale_data), count);
+      const auto* values = static_cast<const float*>(scale_data);
+      size_t i = 0;
+      for (; i + 16 <= count; i += 16) {
+        const __m512 bits = _mm512_loadu_ps(values + i);
+        const __m512i exponents =
+            _mm512_srli_epi32(_mm512_castps_si512(bits), 23);
+        const __m128i packed = _mm512_cvtepi32_epi8(exponents);
+        _mm_storeu_si128(reinterpret_cast<__m128i*>(dst + i), packed);
+      }
+      for (; i < count; ++i) {
+        uint32_t bits;
+        std::memcpy(&bits, values + i, sizeof(bits));
+        dst[i] = static_cast<uint8_t>(bits >> 23);
+      }
     }
   }
 
@@ -1888,9 +1906,9 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
       int local_idx = tp_part_idx % (cpu_tp_count / gpu_tp_count);
 
       uint8_t* w13_weight_dst = (uint8_t*)w13_weight_ptrs[target_gpu_tp];
-      ggml_bf16_t* w13_scale_dst = (ggml_bf16_t*)w13_scale_ptrs[target_gpu_tp];
+      uint8_t* w13_scale_dst = (uint8_t*)w13_scale_ptrs[target_gpu_tp];
       uint8_t* w2_weight_dst = (uint8_t*)w2_weight_ptrs[target_gpu_tp];
-      ggml_bf16_t* w2_scale_dst = (ggml_bf16_t*)w2_scale_ptrs[target_gpu_tp];
+      uint8_t* w2_scale_dst = (uint8_t*)w2_scale_ptrs[target_gpu_tp];
 
       size_t offset_in_gpu_weight = local_idx * cpu_tp_weight_bytes;
       size_t offset_in_gpu_scale = local_idx * cpu_tp_scale_elem_count;
@@ -1939,16 +1957,16 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
               for (size_t col = col_start; col < col_end; col++) {
                 fast_memcpy(w2_weight_dst + col * gpu_weight_stride + gpu_weight_slice_offset,
                             (uint8_t*)down_bb_[expert_id]->b + col * weight_per_col, weight_per_col);
-                fast_scale_to_bf16(
+                fast_scale_to_ue8m0(
                     w2_scale_dst + col * gpu_scale_stride + gpu_scale_slice_offset,
                     *down_bb_[expert_id], col * scale_per_col, scale_per_col);
               }
             } else if (task_id == NUM_WEIGHT_TASKS * 2 + num_down_tasks) {
-              fast_scale_to_bf16(w13_scale_dst + offset_in_gpu_scale,
-                                  *gate_bb_[expert_id], 0,
-                                  cpu_tp_scale_elem_count);
+              fast_scale_to_ue8m0(w13_scale_dst + offset_in_gpu_scale,
+                                   *gate_bb_[expert_id], 0,
+                                   cpu_tp_scale_elem_count);
             } else {
-              fast_scale_to_bf16(
+              fast_scale_to_ue8m0(
                   w13_scale_dst + offset_in_gpu_scale + gpu_tp_scale_elem_count,
                   *up_bb_[expert_id], 0, cpu_tp_scale_elem_count);
             }
@@ -1981,9 +1999,9 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
             int gpu_tp_idx = start_gpu_tp + local_gpu_idx;
 
             uint8_t* w13_weight_dst = (uint8_t*)w13_weight_ptrs[gpu_tp_idx];
-            ggml_bf16_t* w13_scale_dst = (ggml_bf16_t*)w13_scale_ptrs[gpu_tp_idx];
+            uint8_t* w13_scale_dst = (uint8_t*)w13_scale_ptrs[gpu_tp_idx];
             uint8_t* w2_weight_dst = (uint8_t*)w2_weight_ptrs[gpu_tp_idx];
-            ggml_bf16_t* w2_scale_dst = (ggml_bf16_t*)w2_scale_ptrs[gpu_tp_idx];
+            uint8_t* w2_scale_dst = (uint8_t*)w2_scale_ptrs[gpu_tp_idx];
 
             size_t cpu_offset_weight = local_gpu_idx * data_per_gpu_tp_weight;
             size_t cpu_offset_scale = local_gpu_idx * data_per_gpu_tp_scale;
@@ -2019,17 +2037,17 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
 
                 fast_memcpy(w2_weight_dst + col * weight_per_gpu_col,
                             (uint8_t*)down_bb_[expert_id]->b + col_offset_weight, weight_per_gpu_col);
-                fast_scale_to_bf16(w2_scale_dst + col * scale_per_gpu_col,
-                                    *down_bb_[expert_id], col_offset_scale,
-                                    scale_per_gpu_col);
+                fast_scale_to_ue8m0(w2_scale_dst + col * scale_per_gpu_col,
+                                     *down_bb_[expert_id], col_offset_scale,
+                                     scale_per_gpu_col);
               }
             } else if (task_type == NUM_WEIGHT_TASKS * 2 + num_down_tasks) {
-              fast_scale_to_bf16(w13_scale_dst, *gate_bb_[expert_id],
-                                  cpu_offset_scale, data_per_gpu_tp_scale);
+              fast_scale_to_ue8m0(w13_scale_dst, *gate_bb_[expert_id],
+                                   cpu_offset_scale, data_per_gpu_tp_scale);
             } else {
-              fast_scale_to_bf16(w13_scale_dst + gpu_tp_scale_elem_count,
-                                  *up_bb_[expert_id], cpu_offset_scale,
-                                  data_per_gpu_tp_scale);
+              fast_scale_to_ue8m0(w13_scale_dst + gpu_tp_scale_elem_count,
+                                   *up_bb_[expert_id], cpu_offset_scale,
+                                   data_per_gpu_tp_scale);
             }
           },
           nullptr);
