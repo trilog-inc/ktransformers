@@ -92,6 +92,24 @@ inline bool use_nvfp4_bf16_scales() {
 #endif
 }
 
+// DeepSeek-V4 MXFP4 checkpoints already stage group-32 scales as BF16. Keep
+// that representation in the persistent AMX buffers instead of expanding it
+// to FP32. The GEMM converts the same BF16 value to FP32 when it is consumed,
+// preserving the previous numerical behavior while halving scale storage.
+inline bool use_mxfp4_bf16_scales() {
+#if defined(__AVX512BF16__)
+  static const bool enabled = [] {
+    const char* value = std::getenv("KT_MXFP4_BF16_SCALES");
+    if (value == nullptr || *value == '\0') return true;
+    return std::strcmp(value, "0") != 0 && std::strcmp(value, "off") != 0 &&
+           std::strcmp(value, "false") != 0;
+  }();
+  return enabled;
+#else
+  return false;
+#endif
+}
+
 inline bool use_nvfp4_batch_scale_decode() {
 #if defined(__AVX512BF16__)
   static const bool enabled = [] {
@@ -195,11 +213,13 @@ struct BufferBMXFP4KGroupImpl {
     const bool bf16_scales = k_group_size == NVFP4_K_GROUP &&
                              use_nvfp4_blocked_layout() &&
                              use_nvfp4_bf16_scales();
-    const size_t scale_bytes = scale_count *
-                               (k_group_size == NVFP4_K_GROUP
-                                    ? (bf16_scales ? sizeof(ggml_bf16_t)
-                                                   : sizeof(uint8_t))
-                                    : sizeof(float));
+    const bool bf16_mxfp4_scales =
+        k_group_size == 32 && use_mxfp4_bf16_scales();
+    const size_t scale_bytes =
+        scale_count *
+        (k_group_size == NVFP4_K_GROUP
+             ? (bf16_scales ? sizeof(ggml_bf16_t) : sizeof(uint8_t))
+             : (bf16_mxfp4_scales ? sizeof(ggml_bf16_t) : sizeof(float)));
     return (weight_bytes + scale_bytes + 63) & ~size_t{63};
   }
 
@@ -223,6 +243,10 @@ struct BufferBMXFP4KGroupImpl {
 
   bool bf16_nvfp4_scales() const {
     return blocked_nvfp4() && use_nvfp4_bf16_scales();
+  }
+
+  bool bf16_mxfp4_scales() const {
+    return k_group_size == 32 && use_mxfp4_bf16_scales();
   }
 
   bool interleaved_nvfp4() const {
@@ -533,8 +557,20 @@ struct BufferBMXFP4KGroupImpl {
                                  (size_t)n_begin * k_ / 2 + k_begin / 2);
   }
 
-  float* get_scale(int, int n_begin, int k_, int k_begin) {
-    return d + (size_t)n_begin * (k_ / k_group_size) + k_begin / k_group_size;
+  void* get_scale(int, int n_begin, int k_, int k_begin) {
+    const size_t offset =
+        (size_t)n_begin * (k_ / k_group_size) + k_begin / k_group_size;
+    if (bf16_mxfp4_scales()) {
+      return reinterpret_cast<ggml_bf16_t*>(d) + offset;
+    }
+    return d + offset;
+  }
+
+  const void* scale_data(size_t offset = 0) const {
+    if (bf16_mxfp4_scales()) {
+      return reinterpret_cast<const ggml_bf16_t*>(d) + offset;
+    }
+    return d + offset;
   }
 
   uint8_t* get_native_scale(int, int n_begin, int k_, int k_begin) {
@@ -705,6 +741,11 @@ struct GemmKernel224MXFP4SmallKGroup {
   __attribute__((always_inline)) static inline __m512 load_group_scales(const void* scale_data, int vector_idx) {
     static_assert(GROUP_SIZE == 16 || GROUP_SIZE == 32);
     if constexpr (GROUP_SIZE == 32) {
+      if (use_mxfp4_bf16_scales()) {
+        const ggml_bf16_t* scales =
+            static_cast<const ggml_bf16_t*>(scale_data);
+        return _mm512_set1_ps(GGML_BF16_TO_FP32(scales[vector_idx]));
+      }
       const float* scales = static_cast<const float*>(scale_data);
       return _mm512_set1_ps(scales[vector_idx]);
     } else {
@@ -1611,7 +1652,8 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
                           ? "blocked-n16-interleaved"
                           : "blocked-n16"));
     const char* scale_storage = quant_config.group_size != 16
-                                    ? "fp32"
+                                    ? (amx::use_mxfp4_bf16_scales() ? "bf16"
+                                                                    : "fp32")
                                     : (blocked && amx::use_nvfp4_bf16_scales()
                                            ? "bf16"
                                            : "e4m3");
@@ -1757,12 +1799,30 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
           uint64_t expert_idx = task_id;
           uint64_t logical_expert_id = expert_map(physical_to_logical_map, expert_idx);
           size_t scale_elem_count = (config_.hidden_size * config_.intermediate_size) / config_.quant_config.group_size;
-          convert_or_copy(gate_bb_[expert_idx]->d,
-                          (ggml_bf16_t*)config_.gate_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
-          convert_or_copy(up_bb_[expert_idx]->d,
-                          (ggml_bf16_t*)config_.up_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
-          convert_or_copy(down_bb_[expert_idx]->d,
-                          (ggml_bf16_t*)config_.down_scale + (logical_expert_id * scale_elem_count), scale_elem_count);
+          const ggml_bf16_t* gate_scale =
+              (ggml_bf16_t*)config_.gate_scale +
+              (logical_expert_id * scale_elem_count);
+          const ggml_bf16_t* up_scale =
+              (ggml_bf16_t*)config_.up_scale +
+              (logical_expert_id * scale_elem_count);
+          const ggml_bf16_t* down_scale =
+              (ggml_bf16_t*)config_.down_scale +
+              (logical_expert_id * scale_elem_count);
+          if (amx::use_mxfp4_bf16_scales()) {
+            std::memcpy(reinterpret_cast<ggml_bf16_t*>(gate_bb_[expert_idx]->d),
+                        gate_scale, scale_elem_count * sizeof(ggml_bf16_t));
+            std::memcpy(reinterpret_cast<ggml_bf16_t*>(up_bb_[expert_idx]->d),
+                        up_scale, scale_elem_count * sizeof(ggml_bf16_t));
+            std::memcpy(reinterpret_cast<ggml_bf16_t*>(down_bb_[expert_idx]->d),
+                        down_scale, scale_elem_count * sizeof(ggml_bf16_t));
+          } else {
+            convert_or_copy(gate_bb_[expert_idx]->d, gate_scale,
+                            scale_elem_count);
+            convert_or_copy(up_bb_[expert_idx]->d, up_scale,
+                            scale_elem_count);
+            convert_or_copy(down_bb_[expert_idx]->d, down_scale,
+                            scale_elem_count);
+          }
         },
         nullptr);
   }
@@ -1792,6 +1852,19 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
       _mm512_storeu_si512((__m512i*)(dst + i), permuted);
     }
     for (; i < count; i++) dst[i] = ggml_fp32_to_bf16(src[i]);
+  }
+
+  static inline void fast_scale_to_bf16(
+      ggml_bf16_t* __restrict dst,
+      const typename T::BufferB& src,
+      size_t offset,
+      size_t count) {
+    const void* scale_data = src.scale_data(offset);
+    if (src.bf16_mxfp4_scales()) {
+      fast_memcpy(dst, scale_data, count * sizeof(ggml_bf16_t));
+    } else {
+      fast_fp32_to_bf16(dst, static_cast<const float*>(scale_data), count);
+    }
   }
 
   void write_weights_to_buffer(int gpu_tp_count, int cpu_tp_count, int expert_id, const GeneralMOEConfig& full_config,
@@ -1866,14 +1939,18 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
               for (size_t col = col_start; col < col_end; col++) {
                 fast_memcpy(w2_weight_dst + col * gpu_weight_stride + gpu_weight_slice_offset,
                             (uint8_t*)down_bb_[expert_id]->b + col * weight_per_col, weight_per_col);
-                fast_fp32_to_bf16(w2_scale_dst + col * gpu_scale_stride + gpu_scale_slice_offset,
-                                  down_bb_[expert_id]->d + col * scale_per_col, scale_per_col);
+                fast_scale_to_bf16(
+                    w2_scale_dst + col * gpu_scale_stride + gpu_scale_slice_offset,
+                    *down_bb_[expert_id], col * scale_per_col, scale_per_col);
               }
             } else if (task_id == NUM_WEIGHT_TASKS * 2 + num_down_tasks) {
-              fast_fp32_to_bf16(w13_scale_dst + offset_in_gpu_scale, gate_bb_[expert_id]->d, cpu_tp_scale_elem_count);
+              fast_scale_to_bf16(w13_scale_dst + offset_in_gpu_scale,
+                                  *gate_bb_[expert_id], 0,
+                                  cpu_tp_scale_elem_count);
             } else {
-              fast_fp32_to_bf16(w13_scale_dst + offset_in_gpu_scale + gpu_tp_scale_elem_count, up_bb_[expert_id]->d,
-                                cpu_tp_scale_elem_count);
+              fast_scale_to_bf16(
+                  w13_scale_dst + offset_in_gpu_scale + gpu_tp_scale_elem_count,
+                  *up_bb_[expert_id], 0, cpu_tp_scale_elem_count);
             }
           },
           nullptr);
@@ -1942,14 +2019,17 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
 
                 fast_memcpy(w2_weight_dst + col * weight_per_gpu_col,
                             (uint8_t*)down_bb_[expert_id]->b + col_offset_weight, weight_per_gpu_col);
-                fast_fp32_to_bf16(w2_scale_dst + col * scale_per_gpu_col, down_bb_[expert_id]->d + col_offset_scale,
-                                  scale_per_gpu_col);
+                fast_scale_to_bf16(w2_scale_dst + col * scale_per_gpu_col,
+                                    *down_bb_[expert_id], col_offset_scale,
+                                    scale_per_gpu_col);
               }
             } else if (task_type == NUM_WEIGHT_TASKS * 2 + num_down_tasks) {
-              fast_fp32_to_bf16(w13_scale_dst, gate_bb_[expert_id]->d + cpu_offset_scale, data_per_gpu_tp_scale);
+              fast_scale_to_bf16(w13_scale_dst, *gate_bb_[expert_id],
+                                  cpu_offset_scale, data_per_gpu_tp_scale);
             } else {
-              fast_fp32_to_bf16(w13_scale_dst + gpu_tp_scale_elem_count, up_bb_[expert_id]->d + cpu_offset_scale,
-                                data_per_gpu_tp_scale);
+              fast_scale_to_bf16(w13_scale_dst + gpu_tp_scale_elem_count,
+                                  *up_bb_[expert_id], cpu_offset_scale,
+                                  data_per_gpu_tp_scale);
             }
           },
           nullptr);
