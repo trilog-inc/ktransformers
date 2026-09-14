@@ -110,6 +110,26 @@ inline bool use_mxfp4_bf16_scales() {
 #endif
 }
 
+// A negative value preserves the historical AVX512-only dispatch. SGLang sets
+// this explicitly through --kt-mxfp4-amx-min-tokens-per-expert; zero forces
+// AMX for every non-empty expert and a positive value is the per-expert row
+// crossover. Cache it because the decision is made in every routed task.
+inline int mxfp4_amx_min_tokens_per_expert() {
+#if defined(HAVE_AMX) && defined(__AVX512BF16__)
+  static const int threshold = [] {
+    const char* value = std::getenv("KT_MXFP4_AMX_MIN_TOKENS_PER_EXPERT");
+    if (value == nullptr || *value == '\0') return -1;
+    char* end = nullptr;
+    const long parsed = std::strtol(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < 0 || parsed > 1024) return -1;
+    return static_cast<int>(parsed);
+  }();
+  return threshold;
+#else
+  return -1;
+#endif
+}
+
 inline bool use_nvfp4_batch_scale_decode() {
 #if defined(__AVX512BF16__)
   static const bool enabled = [] {
@@ -1427,6 +1447,104 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
   }
 
+#if defined(HAVE_AMX) && defined(__AVX512BF16__)
+  // Genuine AMX-BF16 path for group-32 MXFP4. The packed row-major FP4 tile is
+  // transposed in its compact byte representation, decoded directly into the
+  // VNNI layout consumed by TDPBF16PS, and scaled after each K group. Applying
+  // the per-output-channel group scale to the partial C tile avoids expanding
+  // the persistent FP4 bank or materializing scaled BF16 weights.
+  static void fp4_amx_kgroup(int m, int n, int k, BufferA* ba, BufferB* bb,
+                             BufferC* bc, int ith, int nth) {
+    if (m <= 0) return;
+    if (!enable_amx()) {
+      throw std::runtime_error(
+          "KT_MXFP4_AMX_MIN_TOKENS_PER_EXPERT requested AMX, but XTILEDATA "
+          "permission could not be enabled on a CPUInfer worker");
+    }
+
+    auto [n_start, n_end] = split_range_n(n, ith, nth);
+    if (n_start >= n_end) return;
+    constexpr int TILE_M = 16;
+    constexpr int TILE_N = 16;
+    constexpr int TILE_K = 32;
+
+    alignas(64) uint8_t packed_pairs[TILE_K / 2 * TILE_N];
+    alignas(64) ggml_bf16_t tile_b[TILE_K / 2 * TILE_N * 2];
+    alignas(64) float partial[TILE_M * TILE_N];
+    alignas(64) float accumulated[TILE_M * TILE_N];
+    alignas(64) float group_scales[TILE_N];
+
+    for (int m_begin = 0; m_begin < m; m_begin += TILE_M) {
+      const int m_count = std::min(TILE_M, m - m_begin);
+      TileConfig tile_config;
+      tile_config.set_row_col(0, static_cast<uint8_t>(m_count),
+                              TILE_K * sizeof(ggml_bf16_t));
+      tile_config.set_row_col(1, TILE_K / 2,
+                              TILE_N * 2 * sizeof(ggml_bf16_t));
+      tile_config.set_row_col(2, static_cast<uint8_t>(m_count),
+                              TILE_N * sizeof(float));
+      tile_config.set_config();
+
+      for (int n_begin = n_start; n_begin < n_end; n_begin += TILE_N) {
+        std::memset(accumulated, 0,
+                    static_cast<size_t>(m_count) * TILE_N * sizeof(float));
+
+        for (int k_begin = 0; k_begin < k; k_begin += TILE_K) {
+          const uint8_t* packed_rows = reinterpret_cast<const uint8_t*>(
+              bb->get_submat(n, k, n_begin, k_begin));
+          // Each call transposes eight packed K-pair columns from 16 output
+          // rows. Together they form 16 packed vectors, one per K pair.
+          BufferB::transpose_nvfp4_weight_tile(
+              packed_rows, static_cast<size_t>(k) / 2, packed_pairs,
+              TILE_N);
+          BufferB::transpose_nvfp4_weight_tile(
+              packed_rows + 8, static_cast<size_t>(k) / 2,
+              packed_pairs + 8 * TILE_N, TILE_N);
+          for (int pair = 0; pair < TILE_K / 2; ++pair) {
+            const __m128i packed = _mm_load_si128(
+                reinterpret_cast<const __m128i*>(packed_pairs + pair * TILE_N));
+            const __m512i decoded = mxfp4_to_bf16_32(packed);
+            _mm512_store_si512(
+                reinterpret_cast<__m512i*>(tile_b + pair * TILE_N * 2),
+                decoded);
+          }
+
+          for (int lane = 0; lane < TILE_N; ++lane) {
+            const void* scale = bb->get_scale(n, n_begin + lane, k, k_begin);
+            group_scales[lane] =
+                bb->bf16_mxfp4_scales()
+                    ? GGML_BF16_TO_FP32(
+                          *static_cast<const ggml_bf16_t*>(scale))
+                    : *static_cast<const float*>(scale);
+          }
+
+          _tile_zero(2);
+          _tile_loadd(
+              0, ba->get_submat(m, k, m_begin, k_begin),
+              static_cast<size_t>(k) * sizeof(ggml_bf16_t));
+          _tile_loadd(1, tile_b, TILE_N * 2 * sizeof(ggml_bf16_t));
+          _tile_dpbf16ps(2, 0, 1);
+          _tile_stored(2, partial, TILE_N * sizeof(float));
+
+          const __m512 scales = _mm512_load_ps(group_scales);
+          for (int row = 0; row < m_count; ++row) {
+            const __m512 sum = _mm512_load_ps(accumulated + row * TILE_N);
+            const __m512 group = _mm512_load_ps(partial + row * TILE_N);
+            _mm512_store_ps(accumulated + row * TILE_N,
+                            _mm512_fmadd_ps(group, scales, sum));
+          }
+        }
+
+        for (int row = 0; row < m_count; ++row) {
+          float* output = bc->get_submat(m, n, m_begin + row, n_begin);
+          _mm512_storeu_ps(output,
+                           _mm512_load_ps(accumulated + row * TILE_N));
+        }
+      }
+    }
+  }
+#endif
+
   // mat-mat: 4×4 register tile (M_TILE=4, N_TILE=4 → 16 累加器)。
   // 每 K-group 解码 4 行 N 一次, 被 4 个 token 共享 → PSHUFB 解码开销 / 4。
   // M / N 尾巴回退到 mat-vec 单 token 内层 (V4 chunked-prefill 16/32/64 整数倍, 极少触发)。
@@ -1665,7 +1783,7 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
         "weight_decode=%s, batch_scale_decode=%d, direct_down_input=%d, "
         "direct_bf16_output=%d, "
         "static_schedule=%d, adaptive_schedule=%d, static_gate_up=%d, "
-        "static_down=%d)\n",
+        "static_down=%d, mxfp4_amx_min_tokens=%d)\n",
         tp_part_idx, numa_node_of_cpu(sched_getcpu()), layout,
         blocked ? amx::nvfp4_decode_tile_batch() : 1,
         blocked && amx::nvfp4_decode_tile_batch() > 1
@@ -1684,7 +1802,8 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
         this->use_nvfp4_static_schedule() ? 1 : 0,
         this->use_nvfp4_adaptive_schedule() ? 1 : 0,
         this->use_nvfp4_static_gate_up_schedule() ? 1 : 0,
-        this->use_nvfp4_static_down_schedule() ? 1 : 0);
+        this->use_nvfp4_static_down_schedule() ? 1 : 0,
+        amx::mxfp4_amx_min_tokens_per_expert());
   }
 
   ~AMX_FP4_MOE_TP() = default;
@@ -1703,6 +1822,17 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
   }
   size_t buffer_c_required_size_impl(size_t m, size_t n) const { return T::BufferC::required_size(m, n); }
 
+  bool use_mxfp4_amx(int m) const {
+#if defined(HAVE_AMX) && defined(__AVX512BF16__)
+    const int threshold = amx::mxfp4_amx_min_tokens_per_expert();
+    return config_.quant_config.quant_method == "MXFP4" && threshold >= 0 &&
+           m > 0 && (threshold == 0 || m >= threshold);
+#else
+    (void)m;
+    return false;
+#endif
+  }
+
   std::shared_ptr<typename T::BufferA> make_buffer_a_impl(size_t m, size_t k, void* data) const {
     return std::make_shared<typename T::BufferA>(m, k, data);
   }
@@ -1720,7 +1850,13 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     auto& bb = do_up ? up_bb_[expert_idx] : gate_bb_[expert_idx];
     auto& bc = do_up ? up_bc_[expert_idx] : gate_bc_[expert_idx];
 
-    if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
+    if (use_mxfp4_amx(m)) {
+#if defined(HAVE_AMX) && defined(__AVX512BF16__)
+      amx::GemmKernel224MXFP4SmallKGroup::fp4_amx_kgroup(
+          m, config_.intermediate_size, config_.hidden_size, ba.get(), bb.get(),
+          bc.get(), ith, nth);
+#endif
+    } else if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
       amx::mat_mul_kgroup(m, config_.intermediate_size, config_.hidden_size, group_size, ba, bb, bc, ith, nth);
     } else {
       ggml_bf16_t* direct_output =
@@ -1738,7 +1874,14 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
     auto& group_size = config_.quant_config.group_size;
     int m = m_local_num_[expert_idx];
 
-    if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
+    if (use_mxfp4_amx(m)) {
+#if defined(HAVE_AMX) && defined(__AVX512BF16__)
+      amx::GemmKernel224MXFP4SmallKGroup::fp4_amx_kgroup(
+          m, config_.hidden_size, config_.intermediate_size,
+          down_ba_[expert_idx].get(), down_bb_[expert_idx].get(),
+          down_bc_[expert_idx].get(), ith, nth);
+#endif
+    } else if (qlen > 4 * config_.expert_num / config_.num_experts_per_tok) {
       amx::mat_mul_kgroup(m, config_.hidden_size, config_.intermediate_size, group_size, down_ba_[expert_idx],
                           down_bb_[expert_idx], down_bc_[expert_idx], ith, nth);
     } else {

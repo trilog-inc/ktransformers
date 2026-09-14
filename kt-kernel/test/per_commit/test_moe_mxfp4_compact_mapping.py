@@ -76,7 +76,7 @@ def _forward(cpu_infer, moe, hidden_size: int) -> torch.Tensor:
     return output
 
 
-def test_mxfp4_nonidentity_map_compacts_into_physical_slots():
+def test_mxfp4_nonidentity_map_compacts_into_physical_slots(monkeypatch):
     if not _has_cpu_flag("avx512_bf16"):
         pytest.skip("native MXFP4 AMX test requires AVX-512 BF16")
 
@@ -88,6 +88,10 @@ def test_mxfp4_nonidentity_map_compacts_into_physical_slots():
     moe_module = kt_kernel_ext.moe
     if not hasattr(moe_module, "AMXFP4_KGroup_MOE"):
         pytest.skip("AMXFP4_KGroup_MOE is not compiled")
+
+    # Exercise the genuine AMX-BF16 path even though each expert receives only
+    # one row in this compact-mapping fixture.
+    monkeypatch.setenv("KT_MXFP4_AMX_MIN_TOKENS_PER_EXPERT", "0")
 
     hidden_size = 256
     intermediate_size = 256
