@@ -11,30 +11,72 @@ import torch
 from kt_kernel import kt_kernel_ext
 
 
-def make_source(hidden_size: int, intermediate_size: int):
+def make_source(hidden_size: int, intermediate_size: int, random_source: bool):
     # E2M1 nibble 2 is +1.0. Reusing one source pointer for every logical
     # expert keeps benchmark setup small; the native loader still builds the
     # same NUMA-local compact banks used by inference.
-    packed = 0x22
-    gate = torch.full(
-        (intermediate_size, hidden_size // 2), packed, dtype=torch.uint8
-    )
-    up = gate.clone()
-    down = torch.full(
-        (hidden_size, intermediate_size // 2), packed, dtype=torch.uint8
-    )
-    gate_scale = torch.ones(
-        (intermediate_size, hidden_size // 32), dtype=torch.bfloat16
-    )
+    if random_source:
+        generator = torch.Generator().manual_seed(20260920)
+        gate = torch.randint(
+            0,
+            256,
+            (intermediate_size, hidden_size // 2),
+            dtype=torch.uint8,
+            generator=generator,
+        )
+        up = torch.randint(
+            0,
+            256,
+            (intermediate_size, hidden_size // 2),
+            dtype=torch.uint8,
+            generator=generator,
+        )
+        down = torch.randint(
+            0,
+            256,
+            (hidden_size, intermediate_size // 2),
+            dtype=torch.uint8,
+            generator=generator,
+        )
+        gate_scale = (
+            torch.rand(
+                (intermediate_size, hidden_size // 32), generator=generator
+            )
+            * 0.09
+            + 0.01
+        ).bfloat16()
+    else:
+        packed = 0x22
+        gate = torch.full(
+            (intermediate_size, hidden_size // 2), packed, dtype=torch.uint8
+        )
+        up = gate.clone()
+        down = torch.full(
+            (hidden_size, intermediate_size // 2), packed, dtype=torch.uint8
+        )
+        gate_scale = torch.ones(
+            (intermediate_size, hidden_size // 32), dtype=torch.bfloat16
+        )
     up_scale = gate_scale.clone()
-    down_scale = torch.ones(
-        (hidden_size, intermediate_size // 32), dtype=torch.bfloat16
-    )
+    if random_source:
+        down_scale = (
+            torch.rand(
+                (hidden_size, intermediate_size // 32), generator=generator
+            )
+            * 0.09
+            + 0.01
+        ).bfloat16()
+    else:
+        down_scale = torch.ones(
+            (hidden_size, intermediate_size // 32), dtype=torch.bfloat16
+        )
     return gate, up, down, gate_scale, up_scale, down_scale
 
 
 def build_moe(args):
-    source = make_source(args.hidden_size, args.intermediate_size)
+    source = make_source(
+        args.hidden_size, args.intermediate_size, args.random_source
+    )
     sources = [source] * args.experts
     config = kt_kernel_ext.moe.MOEConfig(
         args.experts,
@@ -84,6 +126,8 @@ def main():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--rounds", type=int, default=40)
     parser.add_argument("--routes", choices=("distinct", "repeated"), default="distinct")
+    parser.add_argument("--rotate-routes", action="store_true")
+    parser.add_argument("--random-source", action="store_true")
     args = parser.parse_args()
 
     cpu_infer, moe, source, physical_to_logical = build_moe(args)
@@ -96,6 +140,12 @@ def main():
         (args.tokens, args.hidden_size), 0.001, dtype=torch.bfloat16
     )
     output = torch.empty_like(hidden_states)
+
+    base_expert_ids = expert_ids.clone()
+
+    def set_routes(step: int):
+        if args.rotate_routes:
+            expert_ids.copy_((base_expert_ids + step * args.topk).remainder(args.experts))
 
     def forward():
         cpu_infer.submit(
@@ -111,10 +161,12 @@ def main():
         )
         cpu_infer.sync()
 
-    for _ in range(args.warmup):
+    for step in range(args.warmup):
+        set_routes(step)
         forward()
     samples = []
-    for _ in range(args.rounds):
+    for step in range(args.rounds):
+        set_routes(args.warmup + step)
         begin = time.perf_counter()
         forward()
         samples.append((time.perf_counter() - begin) * 1000.0)
@@ -124,6 +176,8 @@ def main():
         "routes": args.routes,
         "tokens": args.tokens,
         "topk": args.topk,
+        "rotate_routes": args.rotate_routes,
+        "random_source": args.random_source,
         "median_ms": statistics.median(samples),
         "mean_ms": statistics.fmean(samples),
         "p10_ms": ordered[int(0.10 * (len(ordered) - 1))],
