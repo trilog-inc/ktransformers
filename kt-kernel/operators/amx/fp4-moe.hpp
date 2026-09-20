@@ -1434,26 +1434,8 @@ struct GemmKernel224MXFP4SmallKGroup {
   }
 
 #if defined(__AVX512BF16__)
-  static void expand_mxfp4_scales(const void* source, bool bf16,
-                                  float* destination, int count) {
-    if (!bf16) {
-      std::memcpy(destination, source, static_cast<size_t>(count) * sizeof(float));
-      return;
-    }
-    const uint8_t* packed = static_cast<const uint8_t*>(source);
-    int group = 0;
-    for (; group + 16 <= count; group += 16) {
-      _mm512_store_ps(destination + group,
-                      bf16x16_to_fp32(packed + group * sizeof(ggml_bf16_t)));
-    }
-    const ggml_bf16_t* tail = static_cast<const ggml_bf16_t*>(source);
-    for (; group < count; ++group) {
-      destination[group] = GGML_BF16_TO_FP32(tail[group]);
-    }
-  }
-
   // m=1, group-32 MXFP4 decode. Four output rows share each activation load,
-  // while scales are expanded once before the weight loop. BufferA must have
+  // and avoids interleaving every decoded weight vector. BufferA must have
   // been converted to the natural low-nibble/high-nibble order.
   static void fp4_mat_vec_kgroup_natural(int n, int k, BufferA* ba,
                                          BufferB* bb, BufferC* bc, int ith,
@@ -1465,19 +1447,15 @@ struct GemmKernel224MXFP4SmallKGroup {
     const __m512bh* activation = reinterpret_cast<const __m512bh*>(
         ba->get_submat(1, k, 0, 0));
     float* output = bc->get_submat(1, n, 0, n_start);
-    alignas(64) float scale_scratch[4][K_BLOCK / 32];
-    const bool bf16_scales = bb->bf16_mxfp4_scales();
 
     int ni = n_start;
     for (; ni + 4 <= n_end; ni += 4) {
       const __m128i* weights[4];
-      const float* scales[4];
+      const void* scales[4];
       for (int row = 0; row < 4; ++row) {
         weights[row] = reinterpret_cast<const __m128i*>(
             bb->get_submat(n, k, ni + row, 0));
-        expand_mxfp4_scales(bb->get_scale(n, ni + row, k, 0), bf16_scales,
-                            scale_scratch[row], group_count);
-        scales[row] = scale_scratch[row];
+        scales[row] = bb->get_scale(n, ni + row, k, 0);
       }
 
       __m512 acc0 = _mm512_setzero_ps();
@@ -1491,16 +1469,16 @@ struct GemmKernel224MXFP4SmallKGroup {
         const __m512bh weight2 = (__m512bh)mxfp4_to_bf16_32_natural(weights[2][group]);
         const __m512bh weight3 = (__m512bh)mxfp4_to_bf16_32_natural(weights[3][group]);
         acc0 = _mm512_fmadd_ps(
-            _mm512_set1_ps(scales[0][group]),
+            load_group_scales<32>(scales[0], group),
             _mm512_dpbf16_ps(_mm512_setzero_ps(), act, weight0), acc0);
         acc1 = _mm512_fmadd_ps(
-            _mm512_set1_ps(scales[1][group]),
+            load_group_scales<32>(scales[1], group),
             _mm512_dpbf16_ps(_mm512_setzero_ps(), act, weight1), acc1);
         acc2 = _mm512_fmadd_ps(
-            _mm512_set1_ps(scales[2][group]),
+            load_group_scales<32>(scales[2], group),
             _mm512_dpbf16_ps(_mm512_setzero_ps(), act, weight2), acc2);
         acc3 = _mm512_fmadd_ps(
-            _mm512_set1_ps(scales[3][group]),
+            load_group_scales<32>(scales[3], group),
             _mm512_dpbf16_ps(_mm512_setzero_ps(), act, weight3), acc3);
       }
       reduce4<32>(acc0, acc1, acc2, acc3, output + (ni - n_start), bb);
@@ -1509,14 +1487,13 @@ struct GemmKernel224MXFP4SmallKGroup {
     for (; ni < n_end; ++ni) {
       const __m128i* weights = reinterpret_cast<const __m128i*>(
           bb->get_submat(n, k, ni, 0));
-      expand_mxfp4_scales(bb->get_scale(n, ni, k, 0), bf16_scales,
-                          scale_scratch[0], group_count);
+      const void* scales = bb->get_scale(n, ni, k, 0);
       __m512 acc = _mm512_setzero_ps();
       for (int group = 0; group < group_count; ++group) {
         const __m512bh weight =
             (__m512bh)mxfp4_to_bf16_32_natural(weights[group]);
         acc = _mm512_fmadd_ps(
-            _mm512_set1_ps(scale_scratch[0][group]),
+            load_group_scales<32>(scales, group),
             _mm512_dpbf16_ps(_mm512_setzero_ps(), activation[group], weight),
             acc);
       }
