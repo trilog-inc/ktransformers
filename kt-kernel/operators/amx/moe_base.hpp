@@ -559,7 +559,7 @@ class AMX_MOE_BASE {
       gate_up_ba_[expert_idx]->set_data(gate_up_ba_pool_ptr);
       size_t ba_size = align64(buffer_a_required_size(max_m, config_.hidden_size));
       gate_up_ba_pool_ptr = (void*)((uintptr_t)gate_up_ba_pool_ptr + ba_size);
-      gate_up_ba_[expert_idx]->from_mat(qlen, (ggml_bf16_t*)input, 0, 1);
+      derived()->prepare_decode_gate_input(expert_idx, qlen, input);
     }
 
 #ifdef FORWARD_TIME_PROFILE
@@ -616,7 +616,7 @@ class AMX_MOE_BASE {
       apply_activation_to(activated_expert, nth, qlen,
                           m_local_down_input_ptr_);
     } else {
-      apply_activation(activated_expert, nth, qlen);
+      derived()->apply_decode_activation(activated_expert, nth, qlen);
     }
 
 #ifdef FORWARD_TIME_PROFILE
@@ -632,8 +632,7 @@ class AMX_MOE_BASE {
           activated_expert, nullptr,
           [this, qlen](int task_id) {
             int expert_idx = m_expert_id_map_[task_id];
-            down_ba_[expert_idx]->from_mat(
-                qlen, m_local_gate_output_ptr_[expert_idx], 0, 1);
+            derived()->prepare_decode_down_input(expert_idx, qlen);
           },
           nullptr);
     }
@@ -794,6 +793,21 @@ class AMX_MOE_BASE {
   // ============================================================================
   void derived_init() {
     // Default implementation does nothing - derived classes can override
+  }
+
+  void prepare_decode_gate_input(int expert_idx, int qlen,
+                                 const void* input) {
+    gate_up_ba_[expert_idx]->from_mat(
+        qlen, (ggml_bf16_t*)input, 0, 1);
+  }
+
+  void prepare_decode_down_input(int expert_idx, int qlen) {
+    down_ba_[expert_idx]->from_mat(
+        qlen, m_local_gate_output_ptr_[expert_idx], 0, 1);
+  }
+
+  void apply_decode_activation(int activated_expert, int nth, int qlen) {
+    apply_activation(activated_expert, nth, qlen);
   }
 
   // ============================================================================
