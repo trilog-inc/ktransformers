@@ -641,16 +641,6 @@ struct GemmKernel224MXFP4SmallKGroup {
       0x0000, 0x3F00, 0x3F80, 0x3FC0, 0x4000, 0x4040, 0x4080, 0x40C0,
       0x8000, 0xBF00, 0xBF80, 0xBFC0, 0xC000, 0xC040, 0xC080, 0xC0C0};
 
-#if defined(__AVX512BF16__)
-  // The grouped decoder naturally emits the low nibbles followed by the high
-  // nibbles. Permute the much smaller activation once instead of interleaving
-  // every weight row in the memory-bound decode loop.
-  alignas(64) static constexpr uint16_t natural_group_indices[32] = {
-      0,  2,  4,  6,  8,  10, 12, 14, 16, 18, 20,
-      22, 24, 26, 28, 30, 1,  3,  5,  7,  9,  11,
-      13, 15, 17, 19, 21, 23, 25, 27, 29, 31};
-#endif
-
   alignas(64) static constexpr uint16_t e4m3fn_subnormal_bf16[32] = {
       0x0000, 0x3B00, 0x3B80, 0x3BC0, 0x3C00, 0x3C20, 0x3C40, 0x3C60,
       0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
@@ -674,27 +664,6 @@ struct GemmKernel224MXFP4SmallKGroup {
     const __m512i lut = _mm512_load_si512(fp4_bf16);
     return _mm512_permutexvar_epi16(idx16, lut);
   }
-
-#if defined(__AVX512BF16__)
-  __attribute__((always_inline)) static inline __m512i
-  mxfp4_to_bf16_32_natural(__m128i packed) {
-    const __m128i lo_mask = _mm_set1_epi8(0x0F);
-    const __m128i lo = _mm_and_si128(packed, lo_mask);
-    const __m128i hi = _mm_and_si128(_mm_srli_epi16(packed, 4), lo_mask);
-    const __m256i lo_words = _mm256_cvtepu8_epi16(lo);
-    const __m256i hi_words = _mm256_cvtepu8_epi16(hi);
-    const __m512i indices = _mm512_inserti64x4(
-        _mm512_castsi256_si512(lo_words), hi_words, 1);
-    const __m512i lut = _mm512_load_si512(fp4_bf16);
-    return _mm512_permutexvar_epi16(indices, lut);
-  }
-
-  __attribute__((always_inline)) static inline __m512bh
-  permute_activation_group(__m512bh activation) {
-    const __m512i indices = _mm512_load_si512(natural_group_indices);
-    return (__m512bh)_mm512_permutexvar_epi16(indices, (__m512i)activation);
-  }
-#endif
 
 #if defined(__AVX512BF16__) && defined(__AVX512VBMI__) && \
     defined(__AVX512VL__)
@@ -811,50 +780,8 @@ struct GemmKernel224MXFP4SmallKGroup {
     }
   }
 
-  // BufferA tracks the one-time grouped permutation used by the MXFP4 decode
-  // fast path. All prefill, NVFP4 and AMX paths retain logical BF16 order.
-  struct BufferA : public BufferABF16Impl<GemmKernel224MXFP4SmallKGroup> {
-    using Base = BufferABF16Impl<GemmKernel224MXFP4SmallKGroup>;
-    using Base::get_submat;
-    using Base::k;
-    using Base::max_m;
-    using Base::required_size;
-
-    bool natural_order = false;
-
-    BufferA(int max_m_, int k_, void* ptr) : Base(max_m_, k_, ptr) {}
-
-    void set_data(void* ptr) {
-      Base::set_data(ptr);
-      natural_order = false;
-    }
-
-    void from_mat(int m, ggml_bf16_t* src, int ith, int nth) {
-      Base::from_mat(m, src, ith, nth);
-      natural_order = false;
-    }
-
-    void from_mat_natural(int m, ggml_bf16_t* src, int ith, int nth) {
-#if defined(__AVX512BF16__)
-      assert(m <= max_m);
-      assert(ith == 0 && nth == 1);
-      assert(k % 32 == 0);
-      for (int mi = 0; mi < m; ++mi) {
-        const __m512bh* src_row = reinterpret_cast<const __m512bh*>(
-            src + static_cast<size_t>(mi) * k);
-        __m512bh* dst_row = reinterpret_cast<__m512bh*>(
-            get_submat(m, k, mi, 0));
-        for (int group = 0; group < k / 32; ++group) {
-          dst_row[group] = permute_activation_group(src_row[group]);
-        }
-      }
-      natural_order = true;
-#else
-      from_mat(m, src, ith, nth);
-#endif
-    }
-  };
-
+  // Buffers
+  using BufferA = BufferABF16Impl<GemmKernel224MXFP4SmallKGroup>;        // raw BF16, no quant
   using BufferB = BufferBMXFP4KGroupImpl<GemmKernel224MXFP4SmallKGroup>;
   using BufferC = BufferCReduceImpl<GemmKernel224MXFP4SmallKGroup>;      // FP32 reduce
 
@@ -1433,98 +1360,6 @@ struct GemmKernel224MXFP4SmallKGroup {
     dst[3] = finalize<GROUP_SIZE>(_mm512_reduce_add_ps(s3), bb);
   }
 
-#if defined(__AVX512BF16__)
-  static void expand_mxfp4_scales(const void* source, bool bf16,
-                                  float* destination, int count) {
-    if (!bf16) {
-      std::memcpy(destination, source, static_cast<size_t>(count) * sizeof(float));
-      return;
-    }
-    const uint8_t* packed = static_cast<const uint8_t*>(source);
-    int group = 0;
-    for (; group + 16 <= count; group += 16) {
-      _mm512_store_ps(destination + group,
-                      bf16x16_to_fp32(packed + group * sizeof(ggml_bf16_t)));
-    }
-    const ggml_bf16_t* tail = static_cast<const ggml_bf16_t*>(source);
-    for (; group < count; ++group) {
-      destination[group] = GGML_BF16_TO_FP32(tail[group]);
-    }
-  }
-
-  // m=1, group-32 MXFP4 decode. Four output rows share each activation load,
-  // while scales are expanded once before the weight loop. BufferA must have
-  // been converted to the natural low-nibble/high-nibble order.
-  static void fp4_mat_vec_kgroup_natural(int n, int k, BufferA* ba,
-                                         BufferB* bb, BufferC* bc, int ith,
-                                         int nth) {
-    auto [n_start, n_end] = split_range_n(n, ith, nth);
-    if (n_start >= n_end) return;
-    const int group_count = k / 32;
-    assert(group_count <= K_BLOCK / 32);
-    const __m512bh* activation = reinterpret_cast<const __m512bh*>(
-        ba->get_submat(1, k, 0, 0));
-    float* output = bc->get_submat(1, n, 0, n_start);
-    alignas(64) float scale_scratch[4][K_BLOCK / 32];
-    const bool bf16_scales = bb->bf16_mxfp4_scales();
-
-    int ni = n_start;
-    for (; ni + 4 <= n_end; ni += 4) {
-      const __m128i* weights[4];
-      const float* scales[4];
-      for (int row = 0; row < 4; ++row) {
-        weights[row] = reinterpret_cast<const __m128i*>(
-            bb->get_submat(n, k, ni + row, 0));
-        expand_mxfp4_scales(bb->get_scale(n, ni + row, k, 0), bf16_scales,
-                            scale_scratch[row], group_count);
-        scales[row] = scale_scratch[row];
-      }
-
-      __m512 acc0 = _mm512_setzero_ps();
-      __m512 acc1 = _mm512_setzero_ps();
-      __m512 acc2 = _mm512_setzero_ps();
-      __m512 acc3 = _mm512_setzero_ps();
-      for (int group = 0; group < group_count; ++group) {
-        const __m512bh act = activation[group];
-        const __m512bh weight0 = (__m512bh)mxfp4_to_bf16_32_natural(weights[0][group]);
-        const __m512bh weight1 = (__m512bh)mxfp4_to_bf16_32_natural(weights[1][group]);
-        const __m512bh weight2 = (__m512bh)mxfp4_to_bf16_32_natural(weights[2][group]);
-        const __m512bh weight3 = (__m512bh)mxfp4_to_bf16_32_natural(weights[3][group]);
-        acc0 = _mm512_fmadd_ps(
-            _mm512_set1_ps(scales[0][group]),
-            _mm512_dpbf16_ps(_mm512_setzero_ps(), act, weight0), acc0);
-        acc1 = _mm512_fmadd_ps(
-            _mm512_set1_ps(scales[1][group]),
-            _mm512_dpbf16_ps(_mm512_setzero_ps(), act, weight1), acc1);
-        acc2 = _mm512_fmadd_ps(
-            _mm512_set1_ps(scales[2][group]),
-            _mm512_dpbf16_ps(_mm512_setzero_ps(), act, weight2), acc2);
-        acc3 = _mm512_fmadd_ps(
-            _mm512_set1_ps(scales[3][group]),
-            _mm512_dpbf16_ps(_mm512_setzero_ps(), act, weight3), acc3);
-      }
-      reduce4<32>(acc0, acc1, acc2, acc3, output + (ni - n_start), bb);
-    }
-
-    for (; ni < n_end; ++ni) {
-      const __m128i* weights = reinterpret_cast<const __m128i*>(
-          bb->get_submat(n, k, ni, 0));
-      expand_mxfp4_scales(bb->get_scale(n, ni, k, 0), bf16_scales,
-                          scale_scratch[0], group_count);
-      __m512 acc = _mm512_setzero_ps();
-      for (int group = 0; group < group_count; ++group) {
-        const __m512bh weight =
-            (__m512bh)mxfp4_to_bf16_32_natural(weights[group]);
-        acc = _mm512_fmadd_ps(
-            _mm512_set1_ps(scale_scratch[0][group]),
-            _mm512_dpbf16_ps(_mm512_setzero_ps(), activation[group], weight),
-            acc);
-      }
-      output[ni - n_start] = _mm512_reduce_add_ps(acc);
-    }
-  }
-#endif
-
   // mat-vec: M 个独立 token，N 维 4 行一组累加，摊销 horizontal reduce。
   template <int GROUP_SIZE>
   static void fp4_mat_vec_kgroup_impl(int m, int n, int k, BufferA* ba, BufferB* bb, BufferC* bc, int ith, int nth) {
@@ -1874,14 +1709,6 @@ inline void vec_mul_kgroup(int m, int n, int k, int k_group_size,
                            std::shared_ptr<GemmKernel224MXFP4SmallKGroup::BufferC> bc,
                            int ith, int nth,
                            ggml_bf16_t* direct_output = nullptr) {
-#if defined(__AVX512BF16__)
-  if (m == 1 && k_group_size == 32 && k % 32 == 0 &&
-      ba->natural_order && direct_output == nullptr) {
-    GemmKernel224MXFP4SmallKGroup::fp4_mat_vec_kgroup_natural(
-        n, k, ba.get(), bb.get(), bc.get(), ith, nth);
-    return;
-  }
-#endif
   GemmKernel224MXFP4SmallKGroup::fp4_mat_vec_kgroup(
       m, n, k, k_group_size, ba.get(), bb.get(), bc.get(), ith, nth,
       direct_output);
@@ -1910,7 +1737,6 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
   using Base::gate_bc_;
   using Base::gate_up_ba_;
   using Base::m_local_down_output_ptr_;
-  using Base::m_expert_id_map_;
   using Base::m_local_gate_output_ptr_;
   using Base::m_local_num_;
   using Base::m_local_up_output_ptr_;
@@ -2068,63 +1894,6 @@ class AMX_FP4_MOE_TP : public AMX_MOE_BASE<T, AMX_FP4_MOE_TP<T>> {
           down_ba_[expert_idx], down_bb_[expert_idx], down_bc_[expert_idx],
           ith, nth, direct_output);
     }
-  }
-
-  void prepare_decode_gate_input(int expert_idx, int qlen,
-                                 const void* input) {
-    const int m = m_local_num_[expert_idx];
-    if (qlen == 1 && m == 1 && config_.quant_config.group_size == 32 &&
-        config_.hidden_size % 32 == 0 && !use_mxfp4_amx(m)) {
-      gate_up_ba_[expert_idx]->from_mat_natural(
-          qlen, (ggml_bf16_t*)input, 0, 1);
-      return;
-    }
-    Base::prepare_decode_gate_input(expert_idx, qlen, input);
-  }
-
-  void prepare_decode_down_input(int expert_idx, int qlen) {
-    const int m = m_local_num_[expert_idx];
-    if (qlen == 1 && m == 1 && config_.quant_config.group_size == 32 &&
-        config_.intermediate_size % 32 == 0 && !use_mxfp4_amx(m)) {
-      assert(down_ba_[expert_idx]->natural_order);
-      return;
-    }
-    Base::prepare_decode_down_input(expert_idx, qlen);
-  }
-
-  void apply_decode_activation(int activated_expert, int nth, int qlen) {
-#if defined(__AVX512BF16__)
-    if (qlen == 1 && config_.quant_config.group_size == 32 &&
-        config_.intermediate_size % 32 == 0 && !use_mxfp4_amx(1)) {
-      for (int task_id = 0; task_id < nth * activated_expert; ++task_id) {
-        const int expert_idx = m_expert_id_map_[task_id / nth];
-        const int ith = task_id % nth;
-        auto [n_start, n_end] =
-            T::split_range_n(config_.intermediate_size, ith, nth);
-        const ggml_bf16_t* gate = m_local_gate_output_ptr_[expert_idx];
-        const ggml_bf16_t* up = m_local_up_output_ptr_[expert_idx];
-        ggml_bf16_t* destination = down_ba_[expert_idx]->get_submat(
-            1, config_.intermediate_size, 0, n_start);
-        for (int j = n_start; j < n_end; j += 32) {
-          __m512 gate0, gate1, up0, up1;
-          avx512_32xbf16_to_32xfp32(
-              (__m512i*)(gate + j), &gate0, &gate1);
-          avx512_32xbf16_to_32xfp32((__m512i*)(up + j), &up0, &up1);
-          const __m512 result0 = amx::act_fn(
-              gate0, up0, config_.swiglu_limit, config_.swiglu_alpha);
-          const __m512 result1 = amx::act_fn(
-              gate1, up1, config_.swiglu_limit, config_.swiglu_alpha);
-          const __m512bh logical = _mm512_cvtne2ps_pbh(result1, result0);
-          const __m512bh natural = T::permute_activation_group(logical);
-          _mm512_storeu_si512((void*)(destination + (j - n_start)),
-                              (__m512i)natural);
-        }
-        down_ba_[expert_idx]->natural_order = true;
-      }
-      return;
-    }
-#endif
-    Base::apply_decode_activation(activated_expert, nth, qlen);
   }
 
   void load_weights() {
